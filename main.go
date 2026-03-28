@@ -1,0 +1,28 @@
+package main
+
+import (
+	"ai-gateway/config"
+	"ai-gateway/pkg/llm"
+	"context"
+	"fmt"
+	"log"
+	"time"
+)
+
+func main() {
+	config.LoadConfig()
+	client := llm.NewLLMClient()
+	rootCtx := context.Background()
+	ctx, cancel := context.WithTimeout(rootCtx, 3*time.Second)
+	defer cancel()
+	value, err := client.InvokeLLM(ctx, "请用100字详细介绍一下Golang的并发模型")
+	if err != nil {
+		log.Printf("❌ 调用失败: %v", err)
+		return
+	}
+
+	fmt.Println("✅ AI 回复内容：")
+	fmt.Println("--------------------------------")
+	fmt.Println(value)
+	fmt.Println("--------------------------------")
+}

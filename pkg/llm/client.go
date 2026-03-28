@@ -1,0 +1,81 @@
+package llm
+
+import (
+	"context"
+	"fmt"
+	"ai-gateway/config"
+
+	"github.com/go-resty/resty/v2"
+)
+
+// Request 和 Response 结构体保持不变...
+type Request struct {
+	Model    string    `json:"model"`
+	Messages[]Message `json:"messages"`
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type Response struct {
+	Choices[]struct {
+		Message Message `json:"message"`
+	} `json:"choices"`
+}
+
+// ================= 核心重构部分 =================
+
+// LLMClient 定义大模型客户端结构体
+type LLMClient struct {
+	restyClient *resty.Client // 复用底层的 HTTP 客户端（自带连接池）
+	apiKey      string
+	apiURL      string
+	model       string
+}
+
+// NewLLMClient 是 LLMClient 的构造函数（工厂模式）
+// 导师注：在 main 函数初始化时，只调用一次这个函数，实现全局复用！
+func NewLLMClient() *LLMClient {
+	return &LLMClient{
+		restyClient: resty.New(), // 全局只 New 一次！
+		apiKey:      config.GetEnv("LLM_API_KEY", ""),
+		apiURL:      config.GetEnv("LLM_API_URL", ""),
+		model:       config.GetEnv("LLM_MODEL", ""), // 解决硬编码，从配置读取
+	}
+}
+
+// InvokeLLM 变成了 LLMClient 的方法 (Receiver Method)
+func (c *LLMClient) InvokeLLM(ctx context.Context, prompt string) (string, error) {
+	var result Response
+
+	// 发起 HTTP 请求，使用结构体内部缓存的配置和复用的 client
+	resp, err := c.restyClient.R().
+		SetContext(ctx).
+		SetAuthToken(c.apiKey).
+		SetHeader("Content-Type", "application/json").
+		SetBody(Request{
+			Model: c.model, // 使用配置中的模型名称
+			Messages:[]Message{
+				{Role: "user", Content: prompt},
+			},
+		}).
+		SetResult(&result).
+		Post(c.apiURL)
+
+	if err != nil {
+		return "", fmt.Errorf("network error: %v", err)
+	}
+
+	if resp.IsError() {
+		return "", fmt.Errorf("API返回错误 | 状态码: %d | 内容: %s", resp.StatusCode(), resp.String())
+		// return "", fmt.Errorf("api error: %s", resp.String())
+	}
+
+	if len(result.Choices) > 0 {
+		return result.Choices[0].Message.Content, nil
+	}
+
+	return "", fmt.Errorf("no response from AI")
+}
