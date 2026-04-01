@@ -1,9 +1,9 @@
 package llm
 
 import (
+	"ai-gateway/config"
 	"context"
 	"fmt"
-	"ai-gateway/config"
 
 	"github.com/go-resty/resty/v2"
 )
