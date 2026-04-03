@@ -8,6 +8,73 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
+type Usage struct{
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// Provider 定义模型供应商接口
+type Provider interface{
+	Name() string
+	Invoke(ctx context.Context, prompt string) (string, Usage, error) // 🌟 增加 Usage 返回
+	
+}
+
+// BaseClient 基础客户端（OpenAI 协议兼容）
+type BaseClient struct{
+	name string
+	client *resty.Client
+	apiKey string
+	apiURL string
+	model  string
+}
+
+func NewBaseClient(name,url,key,model string)*BaseClient{
+	return &BaseClient{
+		name:   name,
+		client: resty.New(),
+		apiURL: url,
+		apiKey: key,
+		model:  model,
+	}
+}
+
+func (c *BaseClient) Name() string { return c.name }
+
+func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, error) {
+	var result Response
+
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetAuthToken(c.apiKey).
+		SetHeader("Content-Type", "application/json").
+		SetBody(Request{
+			Model: c.model,
+			Messages: []Message{
+				{Role: "user", Content: prompt},
+			},
+		}).
+		SetResult(&result). // Resty 会自动把 JSON 解析到 result.Usage 里
+		Post(c.apiURL)
+
+	if err != nil {
+		// 🌟 报错时也要返回空的 Usage
+		return "", Usage{}, fmt.Errorf("network error: %v", err)
+	}
+
+	if resp.IsError() {
+		return "", Usage{}, fmt.Errorf("API返回错误 | 状态码: %d | 内容: %s", resp.StatusCode(), resp.String())
+	}
+
+	if len(result.Choices) > 0 {
+		// 🌟 成功：返回内容和解析出来的 Usage
+		return result.Choices[0].Message.Content, result.Usage, nil
+	}
+
+	return "", Usage{}, fmt.Errorf("no response from AI")
+}
+
 // Request 和 Response 结构体保持不变...
 type Request struct {
 	Model    string    `json:"model"`
@@ -23,6 +90,7 @@ type Response struct {
 	Choices[]struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
+	Usage Usage `json:"usage"` // 🌟 新增：捕获 Token 使用情况
 }
 
 // ================= 核心重构部分 =================

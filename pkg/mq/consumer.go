@@ -11,6 +11,7 @@ import (
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/callback"
 	"ai-gateway/pkg/llm" // 确保你的 go.mod 里模块名是 ai-gateway
+	"ai-gateway/pkg/metrics"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -18,7 +19,7 @@ import (
 // KafkaConsumer 消费者结构体
 type KafkaConsumer struct {
 	Reader         *kafka.Reader
-	llmClient      *llm.LLMClient // 依赖注入 LLM 客户端
+	llmRouter      *llm.LLMRouter 
 	callbackClient *callback.CallbackClient
 	limitChan      chan struct{}
 	workerCount    int
@@ -26,8 +27,6 @@ type KafkaConsumer struct {
 
 	dlqProducer *DLQProducer
 	maxRetry    int
-	retryTracker map[string]int
-	retryMu      sync.RWMutex
 }
 
 // TaskMessage 任务消息结构体
@@ -42,7 +41,7 @@ func NewKafkaConsumer(
 	brokers []string, 
 	topic string, 
 	groupID string, 
-	client *llm.LLMClient, 
+	router *llm.LLMRouter,
 	cbClient *callback.CallbackClient, 
 	redisCache *cache.RedisCache, 
 	workerCount int,
@@ -60,14 +59,13 @@ func NewKafkaConsumer(
 
 	return &KafkaConsumer{
 		Reader:         reader,
-		llmClient:      client,
+		llmRouter:      router, 
 		callbackClient: cbClient, // 注入进来
 		limitChan:      make(chan struct{}, workerCount),
 		workerCount:    workerCount,
 		redisCache:     redisCache,
 		dlqProducer:    NewDLQProducer(brokers, dlqTopic),  // ← 用传进来的 dlqTopic
 		maxRetry:       maxRetry,                           // ← 用传进来的 maxRetry
-		retryTracker:   make(map[string]int),
 	}
 }
 
@@ -107,6 +105,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 				return
 			}
 			log.Printf("❌ 拉取消息失败: %v\n", err)
+			time.Sleep(2 * time.Second) // 🌟 失败后歇 2 秒再试，给 Kafka 喘息的机会
 			continue
 		}
 
@@ -115,82 +114,76 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 
 		// 异步处理（在 Goroutine 里）
 		wg.Add(1)
+		// 传入 ctx 和 wg
 		go func(m kafka.Message) {
 			defer wg.Done()
-			defer func() { <-c.limitChan }() // 【关键】任务完成，释放令牌！
-
-			c.processMessage(m) // 调用提取的处理函数
+			defer func() { <-c.limitChan }() 
+			c.processMessage(ctx, m) // 传递 ctx
 		}(msg)
 	}
 }
 
-// processMessage 处理单条消息（提取成独立函数）
-func (c *KafkaConsumer) processMessage(msg kafka.Message) {
-	// 1. 解析 JSON
+func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	var task TaskMessage
 	if err := json.Unmarshal(msg.Value, &task); err != nil {
-		log.Printf("☠️ 毒药消息警告! Offset: %d, Error: %v\n",msg.Offset, err)
-		c.sendToDLQAndCommit(msg, "JSON解析失败: "+err.Error(), 0)
-		c.commit(msg) // 毒药消息直接提交，跳过
+		c.sendToDLQAndCommit(msg, "JSON解析失败", 0)
 		return
 	}
 
-	retryCount := c.getRetryCount(task.TaskID)
-	if retryCount >= c.maxRetry {
-		log.Printf("☠️ 任务 [%s] 重试超限 (%d/%d)，转入DLQ\n", task.TaskID, retryCount, c.maxRetry)
-		c.sendToDLQAndCommit(msg, "重试次数超限", retryCount)
-		c.clearRetryCount(task.TaskID)
+	// 1. 检查 Redis 里的累计重试次数 (分布式持久化)
+	currentRetry, _ := c.redisCache.GetRetryCount(task.TaskID)
+	if currentRetry >= c.maxRetry {
+		log.Printf("☠️ 任务 [%s] 累计重试已达上限 (%d), 转入DLQ", task.TaskID, currentRetry)
+		c.sendToDLQAndCommit(msg, "分布式重试超限", currentRetry)
+		c.redisCache.ClearRetryCount(task.TaskID) // 进死信后清理
 		return
 	}
 
-	// 🌟 2. 查缓存
-	if cached, ok := c.redisCache.GetAIResult(task.TaskID); ok{
-		log.Printf("💰 缓存命中 [%s]", task.TaskID)
-		workCtx, workCancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer workCancel() // 确保资源释放
-		
-		if err := c.callbackClient.SendResult(workCtx, task.TaskID, cached); err != nil {
-			c.incrementRetryCount(task.TaskID)
+	// 2. 查缓存 (商业思维：命中缓存 = 0 Token 消耗)
+	if cached, ok := c.redisCache.GetAIResult(task.TaskID); ok {
+		log.Printf("💰 缓存命中 [%s]，节省了 Token 成本", task.TaskID)
+		if err := c.callbackClient.SendResult(ctx, task.TaskID, cached); err == nil {
+			c.commit(msg)
+			c.redisCache.ClearRetryCount(task.TaskID)
 			return
 		}
-		c.clearRetryCount(task.TaskID)
-		c.commit(msg)
-		return
 	}
 
-
-	// 2. 调 AI
-	log.Printf("🧠 开始处理任务 [%s]\n", task.TaskID)
-
-	workCtx, workCancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer workCancel() // 确保资源释放
-
-	aiResult, err := c.llmClient.InvokeLLM(workCtx, task.Content)
-
-	if err != nil {
-		c.incrementRetryCount(task.TaskID)
-		return
-	}
-
-	go func ()  {
-		if err := c.redisCache.SetAIResult(task.TaskID, aiResult); err != nil {
-			log.Printf("⚠️ 缓存写入失败 [%s]: %v", task.TaskID, err)
-		} else {
-			log.Printf("💾 已缓存结果 [%s]", task.TaskID)
-		}
-	}()	
+	// 3. 执行业务逻辑 (调用 AI)
+	// 🌟 修改点：接收 aiResult 和 usage
+	aiResult, usage, err := c.llmRouter.InvokeWithFallback(ctx, task.Content)
 	
-	// 3. 回调主系统
-	log.Printf("📤 任务 [%s] 回调主系统\n", task.TaskID)
-	if err := c.callbackClient.SendResult(workCtx, task.TaskID, aiResult); err != nil {
-		log.Printf("⚠️ 任务 [%s] 回调失败: %v\n", task.TaskID, err)
-		return // 不提交，Kafka 会重试
+	if err != nil {
+		// 失败处理 (保持不变)
+		metrics.TasksTotal.WithLabelValues("fail").Inc()
+		newCount, _ := c.redisCache.IncrRetryCount(task.TaskID)
+		log.Printf("⚠️ 任务 [%s] AI调用失败 (当前累计重试: %d/%d): %v", task.TaskID, newCount, c.maxRetry, err)
+		return
 	}
 
-	log.Printf("✅ 任务 [%s] 全流程完成\n", task.TaskID)
+	// 🌟 4. 商业逻辑：记录 Token 消耗 (计费)
+	// 注意：即使后续回调失败，Token 已经花了，必须记录
+	if err := c.redisCache.RecordTokenUsage(task.TaskID, usage); err != nil {
+		log.Printf("⚠️ Token 计费记录失败 [%s]: %v", task.TaskID, err)
+	}
+	// 更新全局大盘指标
+	c.redisCache.IncrGlobalTokenStats(usage)
 
-	// 4. 只有 AI + 回调都成功，才提交
-	c.clearRetryCount(task.TaskID)
+	// 5. 成功处理
+	metrics.TasksTotal.WithLabelValues("success").Inc()
+	
+	// 写结果缓存
+	_ = c.redisCache.SetAIResult(task.TaskID, aiResult)
+
+	// 回调主系统
+	if err := c.callbackClient.SendResult(ctx, task.TaskID, aiResult); err != nil {
+		log.Printf("⚠️ 回调失败 [%s]，等待 Kafka 重试 (下次将走缓存)", task.TaskID)
+		// 不提交 Offset，触发 Kafka 重试
+		return
+	}
+
+	log.Printf("✅ 任务 [%s] 完成，消耗 Token: %d", task.TaskID, usage.TotalTokens)
+	c.redisCache.ClearRetryCount(task.TaskID)
 	c.commit(msg)
 }
 
@@ -215,23 +208,6 @@ func (c *KafkaConsumer) commit(msg kafka.Message) {
 	}
 }
 
-func (c *KafkaConsumer) getRetryCount(taskID string) int {
-	c.retryMu.RLock()
-	defer c.retryMu.RUnlock()
-	return c.retryTracker[taskID]
-}
-
-func (c *KafkaConsumer) incrementRetryCount(taskID string) {
-	c.retryMu.Lock()
-	defer c.retryMu.Unlock()
-	c.retryTracker[taskID]++
-}
-
-func (c *KafkaConsumer) clearRetryCount(taskID string) {
-	c.retryMu.Lock()
-	defer c.retryMu.Unlock()
-	delete(c.retryTracker, taskID)
-}
 
 func (c *KafkaConsumer) sendToDLQAndCommit(msg kafka.Message, reason string, retryCount int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -242,4 +218,20 @@ func (c *KafkaConsumer) sendToDLQAndCommit(msg kafka.Message, reason string, ret
 		return
 	}
 	c.commit(msg)
+}
+
+func (c *KafkaConsumer) ReportStats(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			stats := c.Reader.Stats()
+			// Lag 是积压量的关键指标
+			metrics.KafkaLag.WithLabelValues(stats.Topic, "all").Set(float64(stats.Lag))
+		}
+	}
 }

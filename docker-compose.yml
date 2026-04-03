@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   zookeeper:
     image: bitnami/zookeeper:latest
@@ -5,22 +7,33 @@ services:
       - "2181:2181"
     environment:
       - ALLOW_ANONYMOUS_LOGIN=yes
+
   kafka:
     image: bitnami/kafka:3.4
     ports:
       - "9092:9092"
     environment:
-      # 明确禁用 KRaft
       - KAFKA_ENABLE_KRAFT=no
       - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - ALLOW_PLAINTEXT_LISTENER=yes
-      # 必须包含协议前缀 PLAINTEXT://
       - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
       - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092
-      # 明确安全协议映射
       - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT
-      
       - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
       - KAFKA_CFG_NUM_PARTITIONS=3
     depends_on:
       - zookeeper
+
+  # 🌟 必须加上 Redis，否则你的网关启动会因为连不上 Redis 而 Panic
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    # 如果你想让数据持久化，可以取消下面两行的注释
+    # volumes:
+    #   - redis_data:/data
+
+# volumes:
+#   redis_data:

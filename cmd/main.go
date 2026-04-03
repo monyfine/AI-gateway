@@ -1,117 +1,116 @@
 package main
 
 import (
-	"context"
-	"log"
-	"os"
-	"os/signal"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
-
 	"ai-gateway/config"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/callback"
 	"ai-gateway/pkg/llm"
 	"ai-gateway/pkg/mq"
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings" // 🌟 增加 strings 处理
+	"sync"    // 🌟 增加 sync 处理
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
+	log.Println("1. 开始加载配置...")
 	// 1. 加载配置
 	config.LoadConfig()
-	brokers := strings.Split(os.Getenv("KAFKA_BROKERS"), ",")
-	topic := os.Getenv("KAFKA_TOPIC")
-	groupID := os.Getenv("CONSUMER_GROUP")
-	callbackURL := os.Getenv("CALLBACK_URL")
-	
-	dlqTopic := os.Getenv("KAFKA_DLQ_TOPIC")
-	if dlqTopic == "" {
-		dlqTopic = "ai_task_topic_dlq"
+
+	// 2. 初始化 LLM 供应商
+	pName := config.GetEnv("LLM_PRIMARY_NAME", "PrimaryLLM")
+	pURL := config.GetEnv("LLM_PRIMARY_URL", "")
+	pKey := config.GetEnv("LLM_PRIMARY_KEY", "")
+	pModel := config.GetEnv("LLM_PRIMARY_MODEL", "")
+
+	if pURL == "" || pKey == "" {
+		log.Fatalf("❌ 错误: 主模型配置不完整")
 	}
-	
-	maxRetry := 3
-	if v := os.Getenv("MAX_RETRY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxRetry = n
-		}
+	primaryProvider := llm.NewBaseClient(pName, pURL, pKey, pModel)
+
+	bName := config.GetEnv("LLM_BACKUP_NAME", "BackupLLM")
+	bURL := config.GetEnv("LLM_BACKUP_URL", "")
+	bKey := config.GetEnv("LLM_BACKUP_KEY", "")
+	bModel := config.GetEnv("LLM_BACKUP_MODEL", "")
+
+	var providers []llm.Provider
+	providers = append(providers, primaryProvider)
+	if bURL != "" && bKey != "" {
+		providers = append(providers, llm.NewBaseClient(bName, bURL, bKey, bModel))
 	}
 
-	// 【修复 Bug 1】使用 log.Fatalf，如果配置不对直接终止程序
-	if topic == "" || groupID == "" || len(brokers) == 0 || (len(brokers) == 1 && brokers[0] == "") || callbackURL == "" {
-		//这个函数Fatalf打印完日志立马退出
-		log.Fatalf("❌ 致命错误: Kafka 配置信息不完整，请检查 .env 文件")
-	}
-	
-	// 2. 初始化依赖组件
-	log.Println("🚀 正在初始化 AI 异步网关...")
-	client := llm.NewLLMClient()
+	// 3. 初始化路由器
+	router := llm.NewLLMRouter(providers...)
+
+	// 4. 初始化其他组件
+	callbackURL := config.GetEnv("CALLBACK_URL", "http://localhost:8080/callback")
 	callbackClient := callback.NewCallbackClient(callbackURL)
-	// 读取并发配置
-	//控制协程数不然容易炸内存
-	workerCount := 1
-	workerStr := os.Getenv("WORKER_COUNT")
-	if workerStr == ""{
-		workerCount = 1
-	}else{
-		var err error
-		workerCount,err = strconv.Atoi(workerStr)
-		if err != nil {
-			log.Fatalf("❌ WORKER_COUNT 配置错误: %q 不是有效数字", workerStr)
-		}
-		if workerCount <= 0 || workerCount > 100 {
-			log.Fatalf("❌ WORKER_COUNT 超出范围: %d (应在 1-100 之间)", workerCount)
-		}
-	}
+	redisCache := cache.NewRedisCache(24 * time.Hour)
 
-	redisCache := cache.NewRedisCache(24*time.Hour)
+	// 🌟 修复：处理多个 Kafka Broker 地址 (逗号分隔)
+	brokerStr := config.GetEnv("KAFKA_BROKERS", "localhost:9092")
+	brokers := strings.Split(brokerStr, ",")
+	
+	topic := config.GetEnv("KAFKA_TOPIC", "ai_task")
+	groupID := config.GetEnv("CONSUMER_GROUP", "ai_gateway_group")
+	
+	// 5. 启动 Prometheus 指标服务
+	go func() {
+		log.Println("📊 Metrics server starting on :9091/metrics")
+		http.Handle("/metrics", promhttp.Handler())
+		// 这里不需要 Fatalf，避免监控挂了导致整个网关挂掉
+		if err := http.ListenAndServe(":9091", nil); err != nil {
+			log.Printf("⚠️ 指标服务启动失败: %v", err)
+		}
+	}()
+
 	consumer := mq.NewKafkaConsumer(
-		brokers, 
-		topic, 
-		groupID, 
-		client, 
+		brokers,
+		topic,
+		groupID,
+		router,
 		callbackClient,
 		redisCache,
-		workerCount,
-		dlqTopic,    // ← 新增
-		maxRetry,    // ← 新增
+		5, // workerCount
+		"ai_task_dlq",
+		3, // maxRetry
 	)
 
-	
-	// 3. 创建带取消功能的 Context
+	// 6. 准备 Context 和 WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup // 🌟 关键：用于等待协程结束
 
-	// 【修复 Bug 2】引入 WaitGroup，用于等待后台任务真正结束
-	var wg sync.WaitGroup
-
-	// 4. 启动消费者 (放入后台 Goroutine)
-	wg.Add(1) // 登记一个员工
+	// 7. 启动监控上报 (不需要 wg，因为它随 ctx 退出)
+	go consumer.ReportStats(ctx)
+	
+	// 8. 启动消费者 (需要 wg)
+	wg.Add(1)
 	go func() {
-		defer wg.Done() // 员工干完活后，打卡下班
-		// 假设你的 consumer.Start 是一个阻塞的死循环，直到 ctx 被 cancel 才会 return
-		//并不会卡在这里，他开了一个协程Goroutine
-		//主协程（main 函数所在的线程）在启动这个新协程后，不会等待 consumer.Start(ctx) 执行完，而是会立即向下执行后面的代码。
+		defer wg.Done()
 		consumer.Start(ctx)
 	}()
 
-	// 5. 监听系统退出信号 (优雅停机)
+	log.Println("✅ AI 网关已启动，多模型降级与监控已就绪")
+
+	// 9. 优雅停机逻辑
 	sigChan := make(chan os.Signal, 1)
-	// 监听 Ctrl+C (Interrupt) 和 Docker/K8s 的停止信号 (SIGTERM)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// 阻塞在这里，直到收到信号
+	
 	sig := <-sigChan
-	log.Printf("⚠️ 接收到系统信号: %v，准备优雅停机...", sig)
+	log.Printf("⚠️ 接收到系统信号 [%v]，准备优雅停机...", sig)
 
-	// 6. 触发取消信号，通知 consumer 停止拉取新消息，并处理完手头的老消息
-	cancel()
+	// 🌟 核心步骤：
+	cancel()    // 1. 发送取消信号，通知所有协程停止工作
+	wg.Wait()   // 2. 阻塞等待，直到 consumer.Start 里的所有任务处理完毕返回
 
-	// 7. 老板在门口等员工下班 (阻塞等待 wg 归零)
-	log.Println("⏳ 正在等待正在执行的 AI 任务完成...")
-	wg.Wait()
-
-	log.Println("✅ 服务已安全退出，所有状态已保存。")
+	log.Println("✅ 服务已安全退出")
 }
 /*
 消息到达 Kafka ──▶ 拉取消息(Fetch) ──▶ 解析JSON ──▶ AI处理 ──▶ 回调 ──▶ 提交Offset
