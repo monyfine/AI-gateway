@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/callback"
 	"ai-gateway/pkg/llm" // 确保你的 go.mod 里模块名是 ai-gateway
@@ -19,7 +20,7 @@ import (
 // KafkaConsumer 消费者结构体
 type KafkaConsumer struct {
 	Reader         *kafka.Reader
-	llmRouter      *llm.LLMRouter 
+	llmRouter      *llm.LLMRouter
 	callbackClient *callback.CallbackClient
 	limitChan      chan struct{}
 	workerCount    int
@@ -38,16 +39,16 @@ type TaskMessage struct {
 
 // NewKafkaConsumer 构造函数 (参数改为小驼峰命名)
 func NewKafkaConsumer(
-	brokers []string, 
-	topic string, 
-	groupID string, 
+	brokers []string,
+	topic string,
+	groupID string,
 	router *llm.LLMRouter,
-	cbClient *callback.CallbackClient, 
-	redisCache *cache.RedisCache, 
+	cbClient *callback.CallbackClient,
+	redisCache *cache.RedisCache,
 	workerCount int,
 	dlqTopic string,
 	maxRetry int,
-	) *KafkaConsumer {
+) *KafkaConsumer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  brokers,
 		Topic:    topic,
@@ -55,17 +56,16 @@ func NewKafkaConsumer(
 		MinBytes: 10e3, // 10KB
 		MaxBytes: 10e6, // 10MB
 	})
-	
 
 	return &KafkaConsumer{
 		Reader:         reader,
-		llmRouter:      router, 
+		llmRouter:      router,
 		callbackClient: cbClient, // 注入进来
 		limitChan:      make(chan struct{}, workerCount),
 		workerCount:    workerCount,
 		redisCache:     redisCache,
-		dlqProducer:    NewDLQProducer(brokers, dlqTopic),  // ← 用传进来的 dlqTopic
-		maxRetry:       maxRetry,                           // ← 用传进来的 maxRetry
+		dlqProducer:    NewDLQProducer(brokers, dlqTopic), // ← 用传进来的 dlqTopic
+		maxRetry:       maxRetry,                          // ← 用传进来的 maxRetry
 	}
 }
 
@@ -117,7 +117,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 		// 传入 ctx 和 wg
 		go func(m kafka.Message) {
 			defer wg.Done()
-			defer func() { <-c.limitChan }() 
+			defer func() { <-c.limitChan }()
 			c.processMessage(ctx, m) // 传递 ctx
 		}(msg)
 	}
@@ -152,14 +152,31 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	// 3. 执行业务逻辑 (调用 AI)
 	// 🌟 修改点：接收 aiResult 和 usage
 	aiResult, usage, err := c.llmRouter.InvokeWithFallback(ctx, task.Content)
-	
+
+	// 🌟 核心修改点：构造数据库日志对象
+	logEntry := model.RequestLog{
+		TaskID:           task.TaskID,
+		Prompt:           task.Content,
+		Response:         aiResult,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		Status:           "success",
+	}
 	if err != nil {
+		logEntry.Status = "fail"
+		logEntry.ErrorMsg = err.Error()
+		model.DB.Create(&logEntry)
+
 		// 失败处理 (保持不变)
 		metrics.TasksTotal.WithLabelValues("fail").Inc()
 		newCount, _ := c.redisCache.IncrRetryCount(task.TaskID)
 		log.Printf("⚠️ 任务 [%s] AI调用失败 (当前累计重试: %d/%d): %v", task.TaskID, newCount, c.maxRetry, err)
 		return
 	}
+
+	//成功了，把完整的记录存入 MySQL
+	model.DB.Create(&logEntry)
 
 	// 🌟 4. 商业逻辑：记录 Token 消耗 (计费)
 	// 注意：即使后续回调失败，Token 已经花了，必须记录
@@ -171,7 +188,7 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 
 	// 5. 成功处理
 	metrics.TasksTotal.WithLabelValues("success").Inc()
-	
+
 	// 写结果缓存
 	_ = c.redisCache.SetAIResult(task.TaskID, aiResult)
 
@@ -207,7 +224,6 @@ func (c *KafkaConsumer) commit(msg kafka.Message) {
 		log.Printf("🔖 成功提交 Offset: %d\n", msg.Offset)
 	}
 }
-
 
 func (c *KafkaConsumer) sendToDLQAndCommit(msg kafka.Message, reason string, retryCount int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

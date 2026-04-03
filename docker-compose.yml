@@ -26,14 +26,18 @@ services:
     depends_on:
       - zookeeper
 
-  # 🌟 必须加上 Redis，否则你的网关启动会因为连不上 Redis 而 Panic
   redis:
     image: redis:latest
     ports:
       - "6379:6379"
-    # 如果你想让数据持久化，可以取消下面两行的注释
-    # volumes:
-    #   - redis_data:/data
 
-# volumes:
-#   redis_data:
+  mysql:
+    image: mysql:8.0
+    container_name: ai_gateway_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql_data:/var/lib/mysql

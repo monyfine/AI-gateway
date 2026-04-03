@@ -1,4 +1,6 @@
 .env
 *.exe
+ai-gateway
+mysql_data/
 vendor/
-gateway.exe
+.vscode/

@@ -23,14 +23,14 @@ type DLQProducer struct {
 	writer *kafka.Writer
 }
 
-func NewDLQProducer(brockers []string, dlqTopic string)*DLQProducer{
+func NewDLQProducer(brockers []string, dlqTopic string) *DLQProducer {
 	return &DLQProducer{
 		writer: &kafka.Writer{
-			Addr: kafka.TCP(brockers...),
-			Topic: dlqTopic,
-			Balancer: &kafka.LeastBytes{},
+			Addr:         kafka.TCP(brockers...),
+			Topic:        dlqTopic,
+			Balancer:     &kafka.LeastBytes{},
 			RequiredAcks: kafka.RequireAll,
-			Async: false,
+			Async:        false,
 		},
 	}
 }
@@ -46,15 +46,15 @@ func (d *DLQProducer) SendToDLQ(ctx context.Context, originalMsg kafka.Message, 
 		RetryCount:      retryCount,
 	}
 
-	payload,err := json.Marshal(dlqMsg)
-	if err != nil{
+	payload, err := json.Marshal(dlqMsg)
+	if err != nil {
 		return err
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	err = d.writer.WriteMessages(writeCtx,kafka.Message{
-		Key: []byte(originalMsg.Key),
+	err = d.writer.WriteMessages(writeCtx, kafka.Message{
+		Key:   []byte(originalMsg.Key),
 		Value: payload,
 	})
 

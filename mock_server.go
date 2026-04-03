@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"net/http"
 	"io"
+	"net/http"
 )
 
 func main() {
@@ -13,7 +13,7 @@ func main() {
 		body, _ := io.ReadAll(r.Body)
 		fmt.Printf("📩 [主系统] 收到网关回调成功！内容长度: %d\n", len(body))
 		fmt.Printf("📄 内容详情: %s\n", string(body))
-		
+
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"success"}`))
 	})

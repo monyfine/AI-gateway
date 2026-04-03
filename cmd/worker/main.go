@@ -2,6 +2,7 @@ package main
 
 import (
 	"ai-gateway/config"
+	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/callback"
 	"ai-gateway/pkg/llm"
@@ -20,9 +21,11 @@ import (
 )
 
 func main() {
-	log.Println("1. 开始加载配置...")
 	// 1. 加载配置
 	config.LoadConfig()
+	log.Println("1. 开始加载配置...")
+	// 初始化数据库
+	model.InitDB()
 
 	// 2. 初始化 LLM 供应商
 	pName := config.GetEnv("LLM_PRIMARY_NAME", "PrimaryLLM")
@@ -57,10 +60,10 @@ func main() {
 	// 🌟 修复：处理多个 Kafka Broker 地址 (逗号分隔)
 	brokerStr := config.GetEnv("KAFKA_BROKERS", "localhost:9092")
 	brokers := strings.Split(brokerStr, ",")
-	
+
 	topic := config.GetEnv("KAFKA_TOPIC", "ai_task")
 	groupID := config.GetEnv("CONSUMER_GROUP", "ai_gateway_group")
-	
+
 	// 5. 启动 Prometheus 指标服务
 	go func() {
 		log.Println("📊 Metrics server starting on :9091/metrics")
@@ -89,7 +92,7 @@ func main() {
 
 	// 7. 启动监控上报 (不需要 wg，因为它随 ctx 退出)
 	go consumer.ReportStats(ctx)
-	
+
 	// 8. 启动消费者 (需要 wg)
 	wg.Add(1)
 	go func() {
@@ -102,16 +105,17 @@ func main() {
 	// 9. 优雅停机逻辑
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
+
 	sig := <-sigChan
 	log.Printf("⚠️ 接收到系统信号 [%v]，准备优雅停机...", sig)
 
 	// 🌟 核心步骤：
-	cancel()    // 1. 发送取消信号，通知所有协程停止工作
-	wg.Wait()   // 2. 阻塞等待，直到 consumer.Start 里的所有任务处理完毕返回
+	cancel()  // 1. 发送取消信号，通知所有协程停止工作
+	wg.Wait() // 2. 阻塞等待，直到 consumer.Start 里的所有任务处理完毕返回
 
 	log.Println("✅ 服务已安全退出")
 }
+
 /*
 消息到达 Kafka ──▶ 拉取消息(Fetch) ──▶ 解析JSON ──▶ AI处理 ──▶ 回调 ──▶ 提交Offset
                     │                    │          │         │          │

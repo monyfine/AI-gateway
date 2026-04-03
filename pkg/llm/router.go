@@ -1,11 +1,11 @@
 package llm
 
 import (
+	"ai-gateway/pkg/metrics"
 	"context"
 	"errors"
 	"fmt"
 	"log"
-	"ai-gateway/pkg/metrics" 
 	"time"
 
 	"github.com/sony/gobreaker"
@@ -18,13 +18,13 @@ type LLMRouter struct {
 
 func NewLLMRouter(providers ...Provider) *LLMRouter {
 	breakers := make(map[string]*gobreaker.CircuitBreaker)
-	
+
 	for _, p := range providers {
 		// 为每个供应商配置熔断器
 		st := gobreaker.Settings{
 			Name:        p.Name(),
-			MaxRequests: 3,               // 半开状态允许通过的请求数
-			Interval:    5 * time.Second, // 定期清空计数器
+			MaxRequests: 3,                // 半开状态允许通过的请求数
+			Interval:    5 * time.Second,  // 定期清空计数器
 			Timeout:     30 * time.Second, // 熔断器开启后，多久进入半开状态
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
 				// 熔断条件：连续失败超过 5 次，或者失败率超过 50%
@@ -80,17 +80,17 @@ func (r *LLMRouter) InvokeWithFallback(ctx context.Context, prompt string) (stri
 
 			if err == nil {
 				// 🌟 3. 成功了！把书包打开，取出里面的东西
-				data := rawRes.(resultWrapper) 
+				data := rawRes.(resultWrapper)
 				return data.content, data.usage, nil
 			}
 
 			// --- 失败处理逻辑 ---
 			lastErr = err
-			
+
 			// 如果熔断器开了，直接换供应商，别试了
 			if errors.Is(err, gobreaker.ErrOpenState) {
 				log.Printf("🚨 [%s] 熔断器已开启，跳过重试", p.Name())
-				break 
+				break
 			}
 
 			log.Printf("⚠️ [%s] 第 %d 次尝试失败: %v", p.Name(), attempt, err)

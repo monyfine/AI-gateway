@@ -8,29 +8,29 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
-type Usage struct{
+type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
 // Provider 定义模型供应商接口
-type Provider interface{
+type Provider interface {
 	Name() string
 	Invoke(ctx context.Context, prompt string) (string, Usage, error) // 🌟 增加 Usage 返回
-	
+
 }
 
 // BaseClient 基础客户端（OpenAI 协议兼容）
-type BaseClient struct{
-	name string
+type BaseClient struct {
+	name   string
 	client *resty.Client
 	apiKey string
 	apiURL string
 	model  string
 }
 
-func NewBaseClient(name,url,key,model string)*BaseClient{
+func NewBaseClient(name, url, key, model string) *BaseClient {
 	return &BaseClient{
 		name:   name,
 		client: resty.New(),
@@ -78,7 +78,7 @@ func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, 
 // Request 和 Response 结构体保持不变...
 type Request struct {
 	Model    string    `json:"model"`
-	Messages[]Message `json:"messages"`
+	Messages []Message `json:"messages"`
 }
 
 type Message struct {
@@ -87,7 +87,7 @@ type Message struct {
 }
 
 type Response struct {
-	Choices[]struct {
+	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
 	Usage Usage `json:"usage"` // 🌟 新增：捕获 Token 使用情况
@@ -125,7 +125,7 @@ func (c *LLMClient) InvokeLLM(ctx context.Context, prompt string) (string, error
 		SetHeader("Content-Type", "application/json").
 		SetBody(Request{
 			Model: c.model, // 使用配置中的模型名称
-			Messages:[]Message{
+			Messages: []Message{
 				{Role: "user", Content: prompt},
 			},
 		}).

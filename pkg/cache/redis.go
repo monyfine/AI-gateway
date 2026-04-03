@@ -65,21 +65,21 @@ func (c *RedisCache) GetAIResult(taskID string) (string, bool) {
 	return val, true
 }
 
-func (c *RedisCache)IncrRetryCount(taskID string)(int, error){
-	ctx, cancel := context.WithTimeout(context.Background(),c.timeout)
+func (c *RedisCache) IncrRetryCount(taskID string) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	key := "retry_cnt:" + taskID
 	// 1. 原子递增
-	val, err := c.client.Incr(ctx,key).Result()
-	if err != nil{
-		return 0,err
+	val, err := c.client.Incr(ctx, key).Result()
+	if err != nil {
+		return 0, err
 	}
 
 	// 2. 如果是第一次递增（val==1），设置过期时间（兜底，防止内存泄漏）
-	if val == 1{
+	if val == 1 {
 		c.client.Expire(ctx, key, 24*time.Hour)
 	}
-	return int(val),nil
+	return int(val), nil
 }
 
 // GetRetryCount 获取当前重试次数
@@ -105,8 +105,8 @@ func (c *RedisCache) ClearRetryCount(taskID string) error {
 }
 
 // RecordTokenUsage 记录 Token 消耗
-func (c *RedisCache)RecordTokenUsage(taskID string,usage llm.Usage)error{
-	ctx,cancel := context.WithTimeout(context.Background(),c.timeout)
+func (c *RedisCache) RecordTokenUsage(taskID string, usage llm.Usage) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	// 使用 Hash 存储，方便扩展（比如后续增加金额统计）
 	key := "usage:" + taskID
@@ -116,7 +116,7 @@ func (c *RedisCache)RecordTokenUsage(taskID string,usage llm.Usage)error{
 		"total_tokens":      usage.TotalTokens,
 		"recorded_at":       time.Now().Format(time.RFC3339),
 	}
-	return c.client.HSet(ctx,key,data).Err()
+	return c.client.HSet(ctx, key, data).Err()
 }
 
 // GetTotalTokens 获取全局或特定维度的累计消耗（用于成本大盘）
@@ -127,6 +127,6 @@ func (c *RedisCache) IncrGlobalTokenStats(usage llm.Usage) {
 	c.client.IncrBy(ctx, "stats:total_completion_tokens", int64(usage.CompletionTokens))
 }
 
-func (c *RedisCache)Close()error{
+func (c *RedisCache) Close() error {
 	return c.client.Close()
 }

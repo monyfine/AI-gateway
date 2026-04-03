@@ -8,18 +8,18 @@ import (
 )
 
 // LoadConfig 加载配置
-func LoadConfig(){
+func LoadConfig() {
 	// 加载 .env 文件到环境变量
 	err := godotenv.Load()
-	if err != nil{
+	if err != nil {
 		log.Println("Warning: .env file not found, using system env")
 	}
 }
 
 // GetEnv 获取配置，支持默认值
-func GetEnv(key,defaultValue string)string{
+func GetEnv(key, defaultValue string) string {
 	value := os.Getenv(key)
-	if value == ""{
+	if value == "" {
 		return defaultValue
 	}
 	return value
