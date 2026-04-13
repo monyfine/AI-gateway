@@ -3,6 +3,7 @@ package callback
 import (
 	"context"
 	"fmt"
+	"time"
 	"github.com/go-resty/resty/v2"
 )
 
@@ -21,8 +22,10 @@ type CallbackRequest struct {
 
 // NewCallbackClient 构造函数
 func NewCallbackClient(baseURL string) *CallbackClient {
+	client := resty.New()
+	client.SetTimeout(10*time.Second)
 	return &CallbackClient{
-		httpCli: resty.New(),
+		httpCli: client,
 		baseURL: baseURL,
 	}
 }

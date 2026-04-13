@@ -10,7 +10,7 @@ import (
 )
 
 type DeadLetterMessage struct {
-	OriginalMessage []byte    `json:"original_message"`
+	OriginalMessage string    `json:"original_message"`
 	Topic           string    `json:"topic"`
 	Partition       int       `json:"partition"`
 	Offset          int64     `json:"offset"`
@@ -23,21 +23,23 @@ type DLQProducer struct {
 	writer *kafka.Writer
 }
 
-func NewDLQProducer(brockers []string, dlqTopic string) *DLQProducer {
+// --- 在 pkg/mq/dlq.go 的 NewDLQProducer 函数中修改 ---
+func NewDLQProducer(brokers []string, dlqTopic string) *DLQProducer {
 	return &DLQProducer{
 		writer: &kafka.Writer{
-			Addr:         kafka.TCP(brockers...),
-			Topic:        dlqTopic,
-			Balancer:     &kafka.LeastBytes{},
-			RequiredAcks: kafka.RequireAll,
-			Async:        false,
+			Addr:                   kafka.TCP(brokers...),
+			Topic:                  dlqTopic,
+			Balancer:               &kafka.LeastBytes{},
+			RequiredAcks:           kafka.RequireAll,
+			Async:                  false,
+			AllowAutoTopicCreation: true, // 🌟 增加这一行，允许自动创建 DLQ 主题
 		},
 	}
 }
 
 func (d *DLQProducer) SendToDLQ(ctx context.Context, originalMsg kafka.Message, reason string, retryCount int) error {
 	dlqMsg := DeadLetterMessage{
-		OriginalMessage: originalMsg.Value,
+		OriginalMessage: string(originalMsg.Value),
 		Topic:           originalMsg.Topic,
 		Partition:       originalMsg.Partition,
 		Offset:          originalMsg.Offset,
@@ -54,7 +56,7 @@ func (d *DLQProducer) SendToDLQ(ctx context.Context, originalMsg kafka.Message, 
 	defer cancel()
 
 	err = d.writer.WriteMessages(writeCtx, kafka.Message{
-		Key:   []byte(originalMsg.Key),
+		Key:  originalMsg.Key,
 		Value: payload,
 	})
 

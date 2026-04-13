@@ -1,4 +1,4 @@
-package metrics // 🌟 确保包名是 metrics
+package metrics
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
@@ -6,7 +6,6 @@ import (
 )
 
 var (
-	// 🌟 确保变量名首字母大写 L
 	LLMLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "ai_gateway_llm_latency_seconds",
 		Help:    "Latency of LLM API calls",
@@ -22,4 +21,16 @@ var (
 		Name: "ai_gateway_kafka_lag",
 		Help: "Current message lag in Kafka topic",
 	}, []string{"topic", "partition"})
+
+	// 🌟 新增 1：记录 API 请求总量和状态码
+	APIRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ai_gateway_api_requests_total",
+		Help: "Total number of API requests",
+	}, []string{"method", "path", "status"})
+
+	// 🌟 新增 2：记录触发限流的次数
+	RateLimitTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ai_gateway_rate_limit_total",
+		Help: "Total number of rate limit hits",
+	}, []string{"app_name", "limit_type"}) // limit_type 可以是 rpm 或 tpm
 )

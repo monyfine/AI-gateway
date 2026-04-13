@@ -5,19 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/callback"
-	"ai-gateway/pkg/llm" // 确保你的 go.mod 里模块名是 ai-gateway
+	"ai-gateway/pkg/llm"
 	"ai-gateway/pkg/metrics"
 
 	"github.com/segmentio/kafka-go"
 )
 
-// KafkaConsumer 消费者结构体
+// KafkaConsumer 核心消费者结构体
 type KafkaConsumer struct {
 	Reader         *kafka.Reader
 	llmRouter      *llm.LLMRouter
@@ -26,57 +27,52 @@ type KafkaConsumer struct {
 	workerCount    int
 	redisCache     *cache.RedisCache
 
-	dlqProducer *DLQProducer
-	maxRetry    int
+	dlqProducer   *DLQProducer // 🌟 专用于：永久错误 (人工介入)
+	retryProducer *DLQProducer // 🌟 专用于：临时错误 (延迟重试)
+
+	maxRetry int
 }
 
-// TaskMessage 任务消息结构体
-// 🚨 注意：字段首字母必须大写！使用 json tag 映射实际的 key
 type TaskMessage struct {
-	TaskID  string `json:"task_id"` // 建议用 string，兼容性更好
-	Content string `json:"content"`
+	TaskID   string `json:"task_id"`
+	AppKeyID uint   `json:"app_key_id"`
+	APIKey   string `json:"api_key"`
+	RPMLimit int    `json:"rpm_limit"`
+	TPMLimit int    `json:"tpm_limit"`
+	Content  string `json:"content"`
 }
 
-// NewKafkaConsumer 构造函数 (参数改为小驼峰命名)
-func NewKafkaConsumer(
-	brokers []string,
-	topic string,
-	groupID string,
-	router *llm.LLMRouter,
-	cbClient *callback.CallbackClient,
-	redisCache *cache.RedisCache,
-	workerCount int,
-	dlqTopic string,
-	maxRetry int,
-) *KafkaConsumer {
+// NewKafkaConsumer 初始化消费者 (注意新增了 retryTopic 参数)
+func NewKafkaConsumer(brokers []string, topic string, groupID string, router *llm.LLMRouter, cbClient *callback.CallbackClient, redisCache *cache.RedisCache, workerCount int, dlqTopic string, retryTopic string, maxRetry int) *KafkaConsumer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  brokers,
-		Topic:    topic,
-		GroupID:  groupID,
-		MinBytes: 10e3, // 10KB
-		MaxBytes: 10e6, // 10MB
+		Brokers:     brokers,
+		Topic:       topic,
+		GroupID:     groupID,
+		MinBytes:    10e3,
+		MaxBytes:    10e6,
+		StartOffset: kafka.FirstOffset,
+		MaxWait:     1 * time.Second,
 	})
 
 	return &KafkaConsumer{
 		Reader:         reader,
 		llmRouter:      router,
-		callbackClient: cbClient, // 注入进来
+		callbackClient: cbClient,
 		limitChan:      make(chan struct{}, workerCount),
 		workerCount:    workerCount,
 		redisCache:     redisCache,
-		dlqProducer:    NewDLQProducer(brokers, dlqTopic), // ← 用传进来的 dlqTopic
-		maxRetry:       maxRetry,                          // ← 用传进来的 maxRetry
+		dlqProducer:    NewDLQProducer(brokers, dlqTopic),   // 初始化死信生产者
+		retryProducer:  NewDLQProducer(brokers, retryTopic), // 初始化重试生产者
+		maxRetry:       maxRetry,
 	}
 }
 
-// Start 启动消费者阻塞循环
 func (c *KafkaConsumer) Start(ctx context.Context) {
-	log.Println("🚀 Kafka 消费者已启动，正在监听消息...")
+	log.Println("🚀 Kafka 核心消费者已启动，正在监听主队列消息...")
 	defer c.Close()
 
-	var wg sync.WaitGroup // 跟踪所有正在处理的任务
+	var wg sync.WaitGroup
 
-	// 【修复 Bug 2】无论 Start 方法如何退出，都必须等待所有后台任务完成！
 	defer func() {
 		log.Println("⏳ 正在等待所有后台 AI 任务处理完毕...")
 		wg.Wait()
@@ -84,140 +80,161 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 	}()
 
 	for {
-		// 【关键】先拿令牌，控制并发
 		select {
 		case c.limitChan <- struct{}{}:
-			// 拿到令牌，可以继续
 		case <-ctx.Done():
-			// 收到停机信号，不再处理新消息
 			log.Println("🛑 停止拉取新消息，等待处理中的任务...")
 			return
 		}
 
-		// 1. 拉取消息 (Fetch 不会提交 Offset)
-		// 这里的 ctx 是 main 函数传来的，如果 main 调用了 cancel()，FetchMessage 会立刻解除阻塞并返回 context.Canceled
 		msg, err := c.Reader.FetchMessage(ctx)
 		if err != nil {
-			<-c.limitChan // 释放令牌
+			<-c.limitChan
 			if errors.Is(err, context.Canceled) {
-				log.Println("🛑 收到退出信号")
-				wg.Wait()
 				return
 			}
 			log.Printf("❌ 拉取消息失败: %v\n", err)
-			time.Sleep(2 * time.Second) // 🌟 失败后歇 2 秒再试，给 Kafka 喘息的机会
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		log.Printf("📥 收到消息: Topic=%s, Partition=%d, Offset=%d\n",
-			msg.Topic, msg.Partition, msg.Offset)
-
-		// 异步处理（在 Goroutine 里）
 		wg.Add(1)
-		// 传入 ctx 和 wg
 		go func(m kafka.Message) {
 			defer wg.Done()
 			defer func() { <-c.limitChan }()
-			c.processMessage(ctx, m) // 传递 ctx
+
+			// 给予绝对超时控制
+			processCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+
+			c.processMessage(processCtx, m)
 		}(msg)
 	}
 }
 
+// 🌟 核心处理逻辑 (毫无保留的完整版)
 func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	var task TaskMessage
+
+	// ==========================================
+	// 阶段 1：解析与校验 (永久错误判定)
+	// ==========================================
 	if err := json.Unmarshal(msg.Value, &task); err != nil {
-		c.sendToDLQAndCommit(msg, "JSON解析失败", 0)
+		c.sendToDLQAndCommit(msg, "JSON解析失败(数据损坏的永久错误)", 0)
+		return
+	}
+	if task.AppKeyID == 0 || task.APIKey == "" {
+		c.sendToDLQAndCommit(msg, "缺少认证信息(永久错误)", 0)
 		return
 	}
 
-	// 1. 检查 Redis 里的累计重试次数 (分布式持久化)
-	currentRetry, _ := c.redisCache.GetRetryCount(task.TaskID)
-	if currentRetry >= c.maxRetry {
-		log.Printf("☠️ 任务 [%s] 累计重试已达上限 (%d), 转入DLQ", task.TaskID, currentRetry)
-		c.sendToDLQAndCommit(msg, "分布式重试超限", currentRetry)
-		c.redisCache.ClearRetryCount(task.TaskID) // 进死信后清理
+	// ==========================================
+	// 阶段 2：限流与风控 (临时错误判定，包含 Redis 降级策略)
+	// ==========================================
+	rpmAllowed, _ := c.redisCache.CheckRPMLimit(ctx, task.APIKey, task.RPMLimit)
+	tpmAllowed, _ := c.redisCache.CheckTPMLimit(ctx, task.APIKey, task.TPMLimit)
+
+	if !rpmAllowed || !tpmAllowed {
+		log.Printf("🚫 [限流] 租户 %s 触发流控(Redis/本地降级)，转入重试队列！", task.APIKey)
+		// 🌟 绝不 Sleep！立刻扔进重试队列，交出主线程控制权
+		c.sendToRetryAndCommit(msg, "触发租户级限流，等待系统额度恢复", 1)
 		return
 	}
 
-	// 2. 查缓存 (商业思维：命中缓存 = 0 Token 消耗)
-	if cached, ok := c.redisCache.GetAIResult(task.TaskID); ok {
-		log.Printf("💰 缓存命中 [%s]，节省了 Token 成本", task.TaskID)
-		if err := c.callbackClient.SendResult(ctx, task.TaskID, cached); err == nil {
-			c.commit(msg)
-			c.redisCache.ClearRetryCount(task.TaskID)
-			return
-		}
+	// ==========================================
+	// 阶段 3：缓存拦截
+	// ==========================================
+	if cacheResult, ok := c.redisCache.GetCachedResponse(task.Content); ok {
+		log.Printf("💰 缓存命中，直接返回！TaskID: %s", task.TaskID)
+		c.handleCallback(ctx, msg, task, cacheResult, llm.Usage{})
+		return
 	}
 
-	// 3. 执行业务逻辑 (调用 AI)
-	// 🌟 修改点：接收 aiResult 和 usage
+	// ==========================================
+	// 阶段 4：大模型调用与精细化异常处理
+	// ==========================================
 	aiResult, usage, err := c.llmRouter.InvokeWithFallback(ctx, task.Content)
 
-	// 🌟 核心修改点：构造数据库日志对象
+	if err != nil {
+		errStr := err.Error()
+
+		// 记录失败日志落库
+		c.recordDBLog(task, "", usage, "fail", errStr)
+		metrics.TasksTotal.WithLabelValues("fail").Inc()
+
+		// 🌟 【重磅细节】：对大模型错误进行精细化甄别
+		// 1. 如果是 4xx 错误 (比如 400 提示词太长、401 欠费、403 内容涉政违规)
+		// 这种错你重试 100 次也没用，必须进 DLQ 人工处理。
+		if strings.Contains(errStr, "状态码: 4") || strings.Contains(errStr, "invalid") {
+			c.sendToDLQAndCommit(msg, "大模型拒绝请求(4xx永久错误): "+errStr, 0)
+			return
+		}
+
+		// 2. 如果是 5xx 错误或超时 (比如官方 API 宕机、网络抖动)
+		// 属于临时性故障，扔进重试队列，稍后重试
+		c.sendToRetryAndCommit(msg, "大模型网络异常(5xx临时错误): "+errStr, 1)
+		return
+	}
+
+	// ==========================================
+	// 阶段 5：成功落库与对账扣费
+	// ==========================================
+	c.recordDBLog(task, aiResult, usage, "success", "")
+	c.redisCache.RecordTokenUsage(task.TaskID, usage)
+	c.redisCache.IncrGlobalTokenStats(usage)
+	c.redisCache.AddTPMUsage(task.APIKey, usage.TotalTokens) // 精准扣减 TPM 额度
+	_ = c.redisCache.SetCachedResponse(task.Content, aiResult)
+
+	// ==========================================
+	// 阶段 6：回调主系统
+	// ==========================================
+	c.handleCallback(ctx, msg, task, aiResult, usage)
+}
+
+// 统一封装落库逻辑，保持主函数干净
+func (c *KafkaConsumer) recordDBLog(task TaskMessage, response string, usage llm.Usage, status string, errorMsg string) {
 	logEntry := model.RequestLog{
+		AppKeyID:         task.AppKeyID,
 		TaskID:           task.TaskID,
 		Prompt:           task.Content,
-		Response:         aiResult,
+		Response:         response,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
 		TotalTokens:      usage.TotalTokens,
-		Status:           "success",
+		Status:           status,
+		ErrorMsg:         errorMsg,
 	}
-	if err != nil {
-		logEntry.Status = "fail"
-		logEntry.ErrorMsg = err.Error()
-		model.DB.Create(&logEntry)
-
-		// 失败处理 (保持不变)
-		metrics.TasksTotal.WithLabelValues("fail").Inc()
-		newCount, _ := c.redisCache.IncrRetryCount(task.TaskID)
-		log.Printf("⚠️ 任务 [%s] AI调用失败 (当前累计重试: %d/%d): %v", task.TaskID, newCount, c.maxRetry, err)
-		return
-	}
-
-	//成功了，把完整的记录存入 MySQL
-	model.DB.Create(&logEntry)
-
-	// 🌟 4. 商业逻辑：记录 Token 消耗 (计费)
-	// 注意：即使后续回调失败，Token 已经花了，必须记录
-	if err := c.redisCache.RecordTokenUsage(task.TaskID, usage); err != nil {
-		log.Printf("⚠️ Token 计费记录失败 [%s]: %v", task.TaskID, err)
-	}
-	// 更新全局大盘指标
-	c.redisCache.IncrGlobalTokenStats(usage)
-
-	// 5. 成功处理
-	metrics.TasksTotal.WithLabelValues("success").Inc()
-
-	// 写结果缓存
-	_ = c.redisCache.SetAIResult(task.TaskID, aiResult)
-
-	// 回调主系统
-	if err := c.callbackClient.SendResult(ctx, task.TaskID, aiResult); err != nil {
-		log.Printf("⚠️ 回调失败 [%s]，等待 Kafka 重试 (下次将走缓存)", task.TaskID)
-		// 不提交 Offset，触发 Kafka 重试
-		return
-	}
-
-	log.Printf("✅ 任务 [%s] 完成，消耗 Token: %d", task.TaskID, usage.TotalTokens)
-	c.redisCache.ClearRetryCount(task.TaskID)
-	c.commit(msg)
+	// 在异步场景下，短暂忽略 DB 的普通写入报错
+	_ = model.DB.Create(&logEntry).Error
 }
 
-// Close 优雅关闭 (首字母大写，供外部调用)
-func (c *KafkaConsumer) Close() error {
-	if c.dlqProducer != nil {
-		c.dlqProducer.Close()
+// 独立出回调逻辑，包含 HTTP 重试和 最终降级 DLQ
+func (c *KafkaConsumer) handleCallback(ctx context.Context, msg kafka.Message, task TaskMessage, aiResult string, usage llm.Usage) {
+	for i := 1; i <= c.maxRetry; i++ {
+		err := c.callbackClient.SendResult(ctx, task.TaskID, aiResult)
+		if err == nil {
+			log.Printf("✅ 任务 [%s] 回调成功！消耗 Token: %d", task.TaskID, usage.TotalTokens)
+			metrics.TasksTotal.WithLabelValues("success").Inc()
+			c.commit(msg) // 🌟 最终大圆满，提交 Offset
+			return
+		}
+
+		log.Printf("⚠️ 任务 [%s] 第 %d/%d 次回调主系统失败: %v", task.TaskID, i, c.maxRetry, err)
+		if i < c.maxRetry {
+			time.Sleep(time.Duration(1<<i) * time.Second) // 2s, 4s, 8s 的指数退避阻塞 (这里Sleep没关系，因为这已经是收尾阶段)
+		}
 	}
-	return c.Reader.Close()
+
+	// 🌟 主系统彻底挂了 (比如主业务服务器宕机)，这也是一种临时错误
+	// 把已经拿到 AI 结果的消息扔进重试队列，防止花了钱的 AI 答案丢失！
+	c.sendToDLQAndCommit(msg, "回调主系统彻底超时失败(需人工补偿)", c.maxRetry)
 }
 
-// commit 内部辅助方法，自带 5 秒超时控制，防止 Kafka 宕机导致卡死
+// --- 以下为 Kafka 提交与流转的核心方法 ---
+
 func (c *KafkaConsumer) commit(msg kafka.Message) {
-	// 创建一个独立的 5 秒超时 Context
 	commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel() // 记得释放
-
+	defer cancel()
 	if err := c.Reader.CommitMessages(commitCtx, msg); err != nil {
 		log.Printf("⚠️ 提交 Offset 失败[Offset: %d]: %v\n", msg.Offset, err)
 	} else {
@@ -225,12 +242,23 @@ func (c *KafkaConsumer) commit(msg kafka.Message) {
 	}
 }
 
+// sendToDLQAndCommit 发送至【死信队列】，用于存放永久性错误
 func (c *KafkaConsumer) sendToDLQAndCommit(msg kafka.Message, reason string, retryCount int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	if err := c.dlqProducer.SendToDLQ(ctx, msg, reason, retryCount); err != nil {
 		log.Printf("❌ DLQ 投递失败，保留原消息 [Offset: %d]", msg.Offset)
+		return
+	}
+	c.commit(msg)
+}
+
+// sendToRetryAndCommit 🌟 发送至【延迟重试队列】，用于存放临时性错误
+func (c *KafkaConsumer) sendToRetryAndCommit(msg kafka.Message, reason string, retryCount int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.retryProducer.SendToDLQ(ctx, msg, reason, retryCount); err != nil {
+		log.Printf("❌ 重试队列投递失败，保留原消息 [Offset: %d]", msg.Offset)
 		return
 	}
 	c.commit(msg)
@@ -239,15 +267,23 @@ func (c *KafkaConsumer) sendToDLQAndCommit(msg kafka.Message, reason string, ret
 func (c *KafkaConsumer) ReportStats(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			stats := c.Reader.Stats()
-			// Lag 是积压量的关键指标
 			metrics.KafkaLag.WithLabelValues(stats.Topic, "all").Set(float64(stats.Lag))
 		}
 	}
+}
+
+func (c *KafkaConsumer) Close() error {
+	if c.dlqProducer != nil {
+		c.dlqProducer.Close()
+	}
+	if c.retryProducer != nil {
+		c.retryProducer.Close()
+	}
+	return c.Reader.Close()
 }

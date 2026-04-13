@@ -1,0 +1,12 @@
+# prometheus.yml
+global:
+  scrape_interval: 5s # 每 5 秒拉取一次数据，方便我们本地测试快速看到效果
+
+scrape_configs:
+  - job_name: 'ai-gateway'
+    metrics_path: '/metrics'
+    static_configs:
+      # 注意：因为你的 Go 程序是跑在宿主机上的 (go run)，而 Prometheus 跑在 Docker 里
+      # host.docker.internal 是 Docker 提供的特殊域名，指向你的宿主机 (Windows/Mac 适用)
+      # 如果你是 Linux，请把这里改成你电脑的局域网 IP，比如 '192.168.1.100:8080'
+      - targets: ['host.docker.internal:8080']

@@ -1,9 +1,14 @@
 package llm
 
 import (
-	"ai-gateway/config"
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 )
@@ -18,22 +23,34 @@ type Usage struct {
 type Provider interface {
 	Name() string
 	Invoke(ctx context.Context, prompt string) (string, Usage, error) // 🌟 增加 Usage 返回
-
+	InvokeStream(ctx context.Context, prompt string) (<-chan StreamMessage, error)
 }
 
 // BaseClient 基础客户端（OpenAI 协议兼容）
 type BaseClient struct {
-	name   string
-	client *resty.Client
-	apiKey string
-	apiURL string
-	model  string
+	name       string
+	client     *resty.Client
+	httpClient *http.Client // 🌟 新增：用于流式请求的原生 HTTP 客户端
+	apiKey     string
+	apiURL     string
+	model      string
+}
+
+// 🌟 新增：用于在 Channel 中传递流式数据和计费信息
+type StreamMessage struct {
+	Content string
+	Usage   *Usage // 只有流式输出的最后一块，这个字段才会有值
 }
 
 func NewBaseClient(name, url, key, model string) *BaseClient {
+	restyCli := resty.New()
+	restyCli.SetTimeout(30 * time.Second)
 	return &BaseClient{
 		name:   name,
-		client: resty.New(),
+		client: restyCli,
+		httpClient: &http.Client{
+			Timeout: 60 * time.Second, // 流式请求超时时间设长一点
+		},
 		apiURL: url,
 		apiKey: key,
 		model:  model,
@@ -75,6 +92,90 @@ func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, 
 	return "", Usage{}, fmt.Errorf("no response from AI")
 }
 
+// 🌟 修复后的流式调用实现
+func (c *BaseClient) InvokeStream(ctx context.Context, prompt string) (<-chan StreamMessage, error) {
+	reqBody := map[string]interface{}{
+		"model": c.model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"stream": true,
+		"stream_options": map[string]bool{"include_usage": true},
+	}
+	jsonData, _ := json.Marshal(reqBody)
+	
+	req, err := http.NewRequestWithContext(ctx, "POST", c.apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("API返回错误状态码: %d", resp.StatusCode)
+	}
+
+	ch := make(chan StreamMessage)
+
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				break
+			}
+
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+
+			dataStr := strings.TrimPrefix(line, "data: ")
+			if dataStr == "[DONE]" {
+				break
+			}
+
+			var chunk struct {
+				Choices[]struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+				Usage *Usage `json:"usage"`
+			}
+
+			if err := json.Unmarshal([]byte(dataStr), &chunk); err == nil {
+				msg := StreamMessage{}
+				if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+					msg.Content = chunk.Choices[0].Delta.Content
+				}
+				if chunk.Usage != nil {
+					msg.Usage = chunk.Usage
+				}
+
+				if msg.Content != "" || msg.Usage != nil {
+					// 🚨 致命 Bug 修复：增加 select 监听 ctx.Done()
+					// 防止用户中途关掉网页导致 ch <- msg 永久阻塞，引发 Goroutine 泄漏
+					select {
+					case <-ctx.Done():
+						return
+					case ch <- msg:
+					}
+				}
+			}
+		}
+	}()
+	return ch, nil
+}
+
 // Request 和 Response 结构体保持不变...
 type Request struct {
 	Model    string    `json:"model"`
@@ -91,59 +192,4 @@ type Response struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
 	Usage Usage `json:"usage"` // 🌟 新增：捕获 Token 使用情况
-}
-
-// ================= 核心重构部分 =================
-
-// LLMClient 定义大模型客户端结构体
-type LLMClient struct {
-	restyClient *resty.Client // 复用底层的 HTTP 客户端（自带连接池）
-	apiKey      string
-	apiURL      string
-	model       string
-}
-
-// NewLLMClient 是 LLMClient 的构造函数（工厂模式）
-// 导师注：在 main 函数初始化时，只调用一次这个函数，实现全局复用！
-func NewLLMClient() *LLMClient {
-	return &LLMClient{
-		restyClient: resty.New(), // 全局只 New 一次！
-		apiKey:      config.GetEnv("LLM_API_KEY", ""),
-		apiURL:      config.GetEnv("LLM_API_URL", ""),
-		model:       config.GetEnv("LLM_MODEL", ""), // 解决硬编码，从配置读取
-	}
-}
-
-// InvokeLLM 变成了 LLMClient 的方法 (Receiver Method)
-func (c *LLMClient) InvokeLLM(ctx context.Context, prompt string) (string, error) {
-	var result Response
-
-	// 发起 HTTP 请求，使用结构体内部缓存的配置和复用的 client
-	resp, err := c.restyClient.R().
-		SetContext(ctx).
-		SetAuthToken(c.apiKey).
-		SetHeader("Content-Type", "application/json").
-		SetBody(Request{
-			Model: c.model, // 使用配置中的模型名称
-			Messages: []Message{
-				{Role: "user", Content: prompt},
-			},
-		}).
-		SetResult(&result).
-		Post(c.apiURL)
-
-	if err != nil {
-		return "", fmt.Errorf("network error: %v", err)
-	}
-
-	if resp.IsError() {
-		return "", fmt.Errorf("API返回错误 | 状态码: %d | 内容: %s", resp.StatusCode(), resp.String())
-		// return "", fmt.Errorf("api error: %s", resp.String())
-	}
-
-	if len(result.Choices) > 0 {
-		return result.Choices[0].Message.Content, nil
-	}
-
-	return "", fmt.Errorf("no response from AI")
 }

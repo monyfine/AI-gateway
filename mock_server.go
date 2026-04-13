@@ -1,33 +1,29 @@
 package main
 
 import (
-	"fmt"
-	"io"
+	"log"
 	"net/http"
+
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	// 🌟 核心修改：路径必须和 .env 里的 CALLBACK_URL 路径部分完全一致
-	http.HandleFunc("/api/v1/articles/callback", func(w http.ResponseWriter, r *http.Request) {
-		// 读取一下内容，证明真的收到了
-		body, _ := io.ReadAll(r.Body)
-		fmt.Printf("📩 [主系统] 收到网关回调成功！内容长度: %d\n", len(body))
-		fmt.Printf("📄 内容详情: %s\n", string(body))
+	r := gin.Default()
 
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"success"}`))
+	// 模拟主系统的回调接收接口
+	r.POST("/api/v1/articles/callback", func(c *gin.Context) {
+		var req map[string]interface{}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "bad request"})
+			return
+		}
+		
+		log.Printf("🎉 [主系统] 收到 AI 处理完成的回调！TaskID: %v", req["task_id"])
+		log.Printf("📝 内容预览: %v\n", req["content"])
+
+		c.JSON(http.StatusOK, gin.H{"message": "ok"})
 	})
 
-	// 模拟 AI 的接口（如果你想切回模拟 AI 的话）
-	http.HandleFunc("/mock-llm", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("🤖 收到 AI 调用请求")
-		fmt.Fprint(w, `{
-			"choices": [{"message": {"content": "这是模拟的 AI 回复"}}],
-			"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
-		}`)
-	})
-
-	fmt.Println("🛠️ Mock Server 运行在 :8080")
-	fmt.Println("监听路径: /api/v1/articles/callback")
-	http.ListenAndServe(":8080", nil)
+	log.Println("📞 模拟回调服务器已启动，监听 8080 端口...")
+	r.Run(":8080")
 }

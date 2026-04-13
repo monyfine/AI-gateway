@@ -2,9 +2,13 @@ package api
 
 import (
 	"ai-gateway/internal/model"
+	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
+	"ai-gateway/pkg/tokenizer"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -12,10 +16,11 @@ import (
 
 type ChatRequest struct {
 	Prompt string `json:"prompt" binding:"required"`
+	Stream bool   `json:"stream"`
 }
 
 // ChatHandler 处理同步的 AI 请求
-func ChatHandler(router *llm.LLMRouter) gin.HandlerFunc {
+func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req ChatRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -23,12 +28,117 @@ func ChatHandler(router *llm.LLMRouter) gin.HandlerFunc {
 			return
 		}
 
-		// 获取中间件存入的 App 信息
 		appInfo, _ := c.Get("app_info")
 		app := appInfo.(model.AppKey)
+		taskID := uuid.New().String()
 
+		// ==========================================
+		// 🌟 场景 A：前端请求流式输出 (Stream: true)
+		// ==========================================
+		if req.Stream {
+			c.Writer.Header().Set("Content-Type", "text/event-stream")
+			c.Writer.Header().Set("Cache-Control", "no-cache")
+			c.Writer.Header().Set("Connection", "keep-alive")
+
+			// 缓存命中时，模拟流式输出
+			if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
+				c.SSEvent("message", cachedResult)
+				c.SSEvent("message", "[DONE]")
+				return
+			}
+
+			// 调用流式路由
+			ch, err := router.InvokeStreamWithFallback(c.Request.Context(), req.Prompt)
+			if err != nil {
+				c.SSEvent("error", err.Error())
+				return
+			}
+
+			var fullResponse strings.Builder
+			var finalUsage llm.Usage
+
+			// 实时推送数据
+			c.Stream(func(w io.Writer) bool {
+				msg, ok := <-ch
+				if !ok {
+					c.SSEvent("message", "[DONE]")
+					return false // channel 关闭，结束流
+				}
+
+				if msg.Content != "" {
+					fullResponse.WriteString(msg.Content)
+					c.SSEvent("message", msg.Content)
+				}
+				if msg.Usage != nil {
+					finalUsage = *msg.Usage
+				}
+				return true
+			})
+
+			// 异步保存计费与缓存
+			finalText := fullResponse.String()
+			go func() {
+				 var total, promptTokens, compTokens int
+				var status string
+
+				if finalUsage.TotalTokens > 0 {
+					promptTokens = finalUsage.PromptTokens
+					compTokens = finalUsage.CompletionTokens
+					total = finalUsage.TotalTokens
+					status = "success_stream"
+				} else {
+					log.Printf("⚠️ 任务 [%s] 客户端异常断开，触发本地 Tiktoken Fallback 计费", taskID)
+					promptTokens = tokenizer.CountTokens(req.Prompt)
+					compTokens = tokenizer.CountTokens(finalText)
+					total = promptTokens + compTokens
+					status = "interrupted_stream"
+				}
+
+				logEntry := model.RequestLog{
+					AppKeyID:         app.ID,
+					TaskID:           taskID,
+					Prompt:           req.Prompt,
+					Response:         finalText,
+					PromptTokens:     promptTokens,
+					CompletionTokens: compTokens,
+					TotalTokens:      total,
+					Status:           status,
+				}
+				model.DB.Create(&logEntry)
+				redisCache.AddTPMUsage(app.Key, total)
+
+				if status == "success_stream" {
+					_ = redisCache.SetCachedResponse(req.Prompt, finalText)
+				}
+			}()
+			return
+		}
+
+		// ==========================================
+		// 场景 B：非流式输出
+		// ==========================================
+		if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
+			log.Printf("💰 [同步接口] 缓存命中，0 延迟返回！")
+			
+			// 记录一条 0 消耗的日志
+			logEntry := model.RequestLog{
+				AppKeyID: app.ID,
+				TaskID:   uuid.New().String(),
+				Prompt:   req.Prompt,
+				Response: cachedResult,
+				Status:   "success_cached", // 标记为走缓存成功的
+			}
+			model.DB.Create(&logEntry)
+
+			c.JSON(http.StatusOK, gin.H{
+				"task_id": logEntry.TaskID,
+				"content": cachedResult,
+				"usage":   llm.Usage{}, // 缓存命中，消耗为 0
+				"cached":  true,        // 告诉前端这是缓存结果
+			})
+			return
+		}
 		aiResult, usage, err := router.InvokeWithFallback(c.Request.Context(), req.Prompt)
-
 		logEntry := model.RequestLog{
 			AppKeyID:         app.ID,
 			TaskID:           uuid.New().String(), // 生成一个追踪ID
@@ -51,6 +161,11 @@ func ChatHandler(router *llm.LLMRouter) gin.HandlerFunc {
 		logEntry.Status = "success"
 		logEntry.Response = aiResult
 		model.DB.Create(&logEntry)
+
+		_ = redisCache.SetCachedResponse(req.Prompt, aiResult)
+		
+		// 🌟 新增：累加 TPM 消耗
+		redisCache.AddTPMUsage(app.Key, usage.TotalTokens)
 
 		// 返回给前端
 		c.JSON(http.StatusOK, gin.H{
@@ -79,5 +194,21 @@ func CallbackHandler() gin.HandlerFunc {
 		// 这里可以写你自己的业务逻辑，比如更新数据库里的文章状态等
 
 		c.JSON(http.StatusOK, gin.H{"message": "ok"})
+	}
+}
+
+// StatsHandler 返回 JSON 格式的全局统计数据
+func StatsHandler(redisCache *cache.RedisCache) gin.HandlerFunc{
+	return func(c *gin.Context) {
+		stats, err := redisCache.GetGlobalTokenStats()
+		if err != nil{
+			c.JSON(http.StatusInternalServerError,gin.H{"error":"获取统计数据失败"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"code": 200,
+			"msg":  "success",
+			"data": stats,
+		})
 	}
 }
