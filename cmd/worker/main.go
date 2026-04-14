@@ -49,7 +49,7 @@ func main() {
 	// 获取 Kafka 基础配置
 	brokers := strings.Split(config.GetEnv("KAFKA_BROKERS", "localhost:9092"), ",")
 	dlqTopic := config.GetEnv("KAFKA_DLQ_TOPIC", "ai_task_topic_dlq")
-	retryTopic := config.GetEnv("KAFKA_RETRY_TOPIC", "ai_task_topic_retry") 
+	retryTopic := config.GetEnv("KAFKA_RETRY_TOPIC", "ai_task_topic_retry")
 	groupID := config.GetEnv("CONSUMER_GROUP", "ai_gateway_group")
 
 	// 启动 Prometheus 指标服务
@@ -61,16 +61,15 @@ func main() {
 		}
 	}()
 
-	// 🌟 架构升级 1：初始化【快车道】消费者 (专门监听 ai_task_fast，分配 10 个高并发 Worker)
+	// 🌟 核心修改：给 GroupID 增加后缀
 	fastConsumer := mq.NewKafkaConsumer(
-		brokers, "ai_task_fast", groupID, llmRouter, callbackClient, redisCache,
-		10, dlqTopic, retryTopic, 3,
+		brokers, "ai_task_fast", groupID+"_fast", // 独立组 ID
+		llmRouter, callbackClient, redisCache, 10, dlqTopic, retryTopic, 3,
 	)
 
-	// 🌟 架构升级 2：初始化【慢车道】消费者 (专门监听 ai_task_heavy，只分配 2 个并发防止资源霸占)
 	heavyConsumer := mq.NewKafkaConsumer(
-		brokers, "ai_task_heavy", groupID, llmRouter, callbackClient, redisCache,
-		2, dlqTopic, retryTopic, 3,
+		brokers, "ai_task_heavy_v3", groupID+"_heavy", // 独立组 ID
+		llmRouter, callbackClient, redisCache, 2, dlqTopic, retryTopic, 3,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -92,7 +91,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Println("🐢  [慢车道] 消费者已挂载，监听 Topic: ai_task_heavy")
+		log.Println("🐢  [慢车道] 消费者已挂载，监听 Topic: ai_task_heavy_v2")
 		heavyConsumer.Start(ctx)
 	}()
 
@@ -118,14 +117,7 @@ func main() {
 	wg.Wait()
 	log.Println("✅ Worker 服务已安全退出")
 }
+
 /*
-武器 4：离线批处理降级 (Offline Batch Processing)
-如果有个大客户说：“我不在乎等多久，我就是要你们帮我跑完这个极其消耗算力的任务！”
-在真正的工业界，这种任务根本就不应该进入你现在的实时网关集群 (Real-time Gateway)。
 
-大厂会搭建一套完全独立的**“离线批处理集群”**（例如基于 Spark、Hadoop 或者纯 Serverless 异步任务）。
-
-这种请求走的是另一套专门的 API 接口，用户提交任务后，只拿到一个 JobID，然后他就可以关电脑睡觉去了。等几个小时后跑完了，系统发个邮件或 Webhook 通知他。
-
-架构金句：“在业务架构上，严格区分在线实时计算（Online/Real-time）与离线批处理（Offline/Batch），用完全不同的计算集群来处理不同生命周期的任务。”
-*/
+ */

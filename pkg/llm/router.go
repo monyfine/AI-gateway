@@ -23,15 +23,18 @@ func NewLLMRouter(providers ...Provider) *LLMRouter {
 		// 为每个供应商配置熔断器
 		st := gobreaker.Settings{
 			Name:        p.Name(),
-			MaxRequests: 3,                // 半开状态允许通过的请求数
-			Interval:    5 * time.Second,  // 定期清空计数器
-			Timeout:     30 * time.Second, // 熔断器开启后，多久进入半开状态
+			MaxRequests: 100,              // 半开状态允许通过的请求数
+			Interval:    10 * time.Second, // 定期清空计数器
+			Timeout:     10 * time.Second, // 熔断器开启后，多久进入半开状态尝试恢复
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
-				// 熔断条件：连续失败超过 5 次，或者失败率超过 50%
-				return counts.ConsecutiveFailures > 5
+				// 🌟 压测级抗压配置：
+				// 至少得有 50 个请求进来，并且失败率超过 50%，才触发熔断！
+				// 这样就不会因为瞬间的 5 个网络抖动而误杀整个系统。
+				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+				return counts.Requests >= 50 && failureRatio >= 0.5
 			},
 			OnStateChange: func(name string, from, to gobreaker.State) {
-				log.Printf("🚨 熔断器 [%s] 状态变更: %v -> %v", name, from, to)
+				log.Printf("🚨 熔断器[%s] 状态变更: %v -> %v", name, from, to)
 			},
 		}
 		breakers[p.Name()] = gobreaker.NewCircuitBreaker(st)

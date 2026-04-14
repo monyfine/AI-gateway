@@ -14,6 +14,7 @@ import (
 	"ai-gateway/pkg/callback"
 	"ai-gateway/pkg/llm"
 	"ai-gateway/pkg/metrics"
+	"ai-gateway/pkg/tokenizer"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -82,6 +83,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 	for {
 		select {
 		case c.limitChan <- struct{}{}:
+		log.Println("🔓 拿到令牌，开始 Fetch...") // 加这一行
 		case <-ctx.Done():
 			log.Println("🛑 停止拉取新消息，等待处理中的任务...")
 			return
@@ -104,7 +106,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 			defer func() { <-c.limitChan }()
 
 			// 给予绝对超时控制
-			processCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			processCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
 
 			c.processMessage(processCtx, m)
@@ -112,7 +114,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 	}
 }
 
-// 🌟 核心处理逻辑 (毫无保留的完整版)
+// 🌟 核心处理逻辑
 func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	var task TaskMessage
 
@@ -123,11 +125,12 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 		c.sendToDLQAndCommit(msg, "JSON解析失败(数据损坏的永久错误)", 0)
 		return
 	}
+	
 	if task.AppKeyID == 0 || task.APIKey == "" {
 		c.sendToDLQAndCommit(msg, "缺少认证信息(永久错误)", 0)
 		return
 	}
-
+	log.Printf("📥 [收到任务] ID: %s, 文本长度: %d 字符", task.TaskID, len(task.Content))
 	// ==========================================
 	// 阶段 2：限流与风控 (临时错误判定，包含 Redis 降级策略)
 	// ==========================================
@@ -153,7 +156,35 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	// ==========================================
 	// 阶段 4：大模型调用与精细化异常处理
 	// ==========================================
-	aiResult, usage, err := c.llmRouter.InvokeWithFallback(ctx, task.Content)
+	var aiResult string
+	var usage llm.Usage
+	var err error
+
+	// 1. 计算当前任务的 Token 数量
+	tokenCount := tokenizer.CountTokens(task.Content)
+	log.Printf("📊 [Token 统计] ID: %s, 计算结果: %d Tokens", task.TaskID, tokenCount)
+	
+	// 2. 定义大任务的阈值（比如 60,000 Tokens）
+	const LargeTaskThreshold = 5000
+
+	if tokenCount > LargeTaskThreshold {
+		log.Printf("🔥 触发 Tree-Reduce 引擎！TaskID: %s, 预估 Token: %d", task.TaskID, tokenCount)
+		
+		instruction := "请提取核心要点并进行详细总结" 
+		
+		// 🌟 调用带有 Overlap 的切分器
+		// 每个块 40000 Token，相邻块重叠 2000 Token (约 5% 的重叠率)console.log('::: ', );
+		chunks := tokenizer.SplitTextWithOverlap(task.Content, 5000, 500)
+		log.Printf("📦 任务已被切分为 %d 个子块并发处理", len(chunks))
+
+		// 🌟 传入 redisCache 开启断点续传保护
+		mrEngine := llm.NewMapReduceEngine(c.llmRouter, c.redisCache)
+		aiResult, usage, err = mrEngine.ProcessLargeTask(ctx, instruction, chunks)
+
+	} else {
+		// 普通任务，走原来的单次调用逻辑
+		aiResult, usage, err = c.llmRouter.InvokeWithFallback(ctx, task.Content)
+	}
 
 	if err != nil {
 		errStr := err.Error()
@@ -162,16 +193,13 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 		c.recordDBLog(task, "", usage, "fail", errStr)
 		metrics.TasksTotal.WithLabelValues("fail").Inc()
 
-		// 🌟 【重磅细节】：对大模型错误进行精细化甄别
 		// 1. 如果是 4xx 错误 (比如 400 提示词太长、401 欠费、403 内容涉政违规)
-		// 这种错你重试 100 次也没用，必须进 DLQ 人工处理。
 		if strings.Contains(errStr, "状态码: 4") || strings.Contains(errStr, "invalid") {
 			c.sendToDLQAndCommit(msg, "大模型拒绝请求(4xx永久错误): "+errStr, 0)
 			return
 		}
 
 		// 2. 如果是 5xx 错误或超时 (比如官方 API 宕机、网络抖动)
-		// 属于临时性故障，扔进重试队列，稍后重试
 		c.sendToRetryAndCommit(msg, "大模型网络异常(5xx临时错误): "+errStr, 1)
 		return
 	}
