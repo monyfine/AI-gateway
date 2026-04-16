@@ -4,14 +4,19 @@ import (
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
+	"ai-gateway/pkg/mq"
 	"ai-gateway/pkg/tokenizer"
+	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/segmentio/kafka-go"
 )
 
 type ChatRequest struct {
@@ -78,7 +83,7 @@ func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.Handler
 			// 异步保存计费与缓存
 			finalText := fullResponse.String()
 			go func() {
-				 var total, promptTokens, compTokens int
+				var total, promptTokens, compTokens int
 				var status string
 
 				if finalUsage.TotalTokens > 0 {
@@ -209,6 +214,48 @@ func StatsHandler(redisCache *cache.RedisCache) gin.HandlerFunc{
 			"code": 200,
 			"msg":  "success",
 			"data": stats,
+		})
+	}
+}
+// RetryDLQHandler 触发死信队列重试
+func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		reader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: brokers,
+			Topic:   dlqTopic,
+			GroupID: "dlq_admin_recovery_group", 
+		})
+		defer reader.Close()
+
+		writer := &kafka.Writer{
+			Addr:         kafka.TCP(brokers...),
+			Topic:        targetTopic,
+			RequiredAcks: kafka.RequireAll,
+		}
+		defer writer.Close()
+
+		recoveredCount := 0
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		for {
+			msg, err := reader.ReadMessage(ctx)
+			if err != nil { break } // 读完或超时退出
+
+			var dlqMsg mq.DeadLetterMessage
+			if err := json.Unmarshal(msg.Value, &dlqMsg); err == nil {
+				// 重新投递回原来的主队列
+				writer.WriteMessages(context.Background(), kafka.Message{
+					Key:   msg.Key,
+					Value: []byte(dlqMsg.OriginalMessage), 
+				})
+				recoveredCount++
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "补偿执行完毕",
+			"recovered_count": recoveredCount,
 		})
 	}
 }

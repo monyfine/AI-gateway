@@ -53,7 +53,6 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 				app = cached.App
 				needQueryDB = false
 				
-				// 🌟 进阶改造：阈值滑动续期
 				// 假设总有效期是 5 分钟。只有当剩余有效期不足 2 分钟时，才给它续命。
 				// 这样 1000 个并发请求过来，只要它还处于充足的有效期内，就不会触发任何 Store 写入！
 				if time.Until(cached.ExpiresAt) < 2*time.Minute {

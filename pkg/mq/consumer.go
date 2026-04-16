@@ -165,7 +165,7 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	log.Printf("📊 [Token 统计] ID: %s, 计算结果: %d Tokens", task.TaskID, tokenCount)
 	
 	// 2. 定义大任务的阈值（比如 60,000 Tokens）
-	const LargeTaskThreshold = 5000
+	const LargeTaskThreshold = 60000
 
 	if tokenCount > LargeTaskThreshold {
 		log.Printf("🔥 触发 Tree-Reduce 引擎！TaskID: %s, 预估 Token: %d", task.TaskID, tokenCount)
@@ -174,7 +174,7 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 		
 		// 🌟 调用带有 Overlap 的切分器
 		// 每个块 40000 Token，相邻块重叠 2000 Token (约 5% 的重叠率)console.log('::: ', );
-		chunks := tokenizer.SplitTextWithOverlap(task.Content, 5000, 500)
+		chunks := tokenizer.SplitTextWithOverlap(task.Content, 40000, 2000)
 		log.Printf("📦 任务已被切分为 %d 个子块并发处理", len(chunks))
 
 		// 🌟 传入 redisCache 开启断点续传保护

@@ -60,3 +60,33 @@ services:
     depends_on:
       - prometheus
     restart: always
+  # 🌟 新增：AI 网关核心服务
+  ai-api:
+    build: .
+    container_name: ai_api_server
+    command: ["./api-server"] # 指定运行 api 二进制
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    environment:
+      - DB_DSN=root:123456@tcp(mysql:3306)/gateway?charset=utf8mb4&parseTime=True&loc=Local
+      - REDIS_ADDR=redis:6379
+      - KAFKA_BROKERS=kafka1:9092,kafka2:9093,kafka3:9094
+    depends_on:
+      - mysql
+      - redis
+      - kafka1
+
+  # 🌟 网关 Worker 节点 (后台消费，不需要暴露端口)
+  ai-worker:
+    build: .
+    container_name: ai_worker_server
+    command: ["./worker-server"] # 指定运行 worker 二进制
+    environment:
+      - DB_DSN=root:123456@tcp(mysql:3306)/gateway?charset=utf8mb4&parseTime=True&loc=Local
+      - REDIS_ADDR=redis:6379
+      - KAFKA_BROKERS=kafka1:9092,kafka2:9093,kafka3:9094
+    depends_on:
+      - mysql
+      - redis
+      - kafka1

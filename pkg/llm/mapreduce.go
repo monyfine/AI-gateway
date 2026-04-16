@@ -94,9 +94,13 @@ func (e *MapReduceEngine) executeBatch(ctx context.Context, instruction string, 
 	batchUsage := Usage{}
 	var firstErr error
 
+	limitChan := make(chan struct{}, 5)
+
 	for i, chunk := range chunks {
 		wg.Add(1)
+		limitChan <- struct{}{}
 		go func(index int, text string) {
+			defer func() { <-limitChan }()
 			defer wg.Done()
 
 			var prompt string

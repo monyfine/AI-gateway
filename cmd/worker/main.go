@@ -17,6 +17,7 @@ import (
 	"ai-gateway/pkg/callback"
 	"ai-gateway/pkg/llm"
 	"ai-gateway/pkg/mq"
+	"ai-gateway/internal/task"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -25,6 +26,7 @@ func main() {
 	log.Println("🚀 正在启动 AI Gateway Worker 服务 (双核流控架构)...")
 	config.LoadConfig()
 	model.InitDB()
+	task.StartLogCleaner(30) // 保留 30 天日志
 
 	// 初始化 LLM
 	primaryProvider := llm.NewBaseClient(
@@ -76,24 +78,15 @@ func main() {
 	var wg sync.WaitGroup
 
 	// 分别启动状态汇报
-	go fastConsumer.ReportStats(ctx)
-	go heavyConsumer.ReportStats(ctx)
+	workerMode := config.GetEnv("WORKER_MODE", "all") // 读取环境变量
 
-	// 🌟 启动快车道监听
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		log.Println("🏎️  [快车道] 消费者已挂载，监听 Topic: ai_task_fast")
-		fastConsumer.Start(ctx)
-	}()
+	if workerMode == "all" || workerMode == "fast" {
+		go fastConsumer.Start(ctx)
+	}
 
-	// 🌟 启动慢车道监听
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		log.Println("🐢  [慢车道] 消费者已挂载，监听 Topic: ai_task_heavy_v2")
-		heavyConsumer.Start(ctx)
-	}()
+	if workerMode == "all" || workerMode == "heavy" {
+		go heavyConsumer.Start(ctx)
+	}
 
 	// ==========================================
 	// 优雅停机逻辑 (完美兼容双消费者)
@@ -119,5 +112,4 @@ func main() {
 }
 
 /*
-
  */

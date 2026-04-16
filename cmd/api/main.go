@@ -69,3 +69,25 @@ func main() {
 
 	log.Println("✅ API 服务已安全、平滑地退出")
 }
+/*
+[发起方]
+   │
+   ├─► 【API 流】 cmd/api/main.go -> internal/api/router.go
+   │       └── internal/api/middleware.go (AuthMiddleware: 鉴权与 Redis 限流)
+   │           └── internal/api/handler.go (ChatHandler: 业务逻辑中心)
+   │                   ├── 1. pkg/cache/redis.go (GetCachedResponse: 查缓存)
+   │                   ├── 2. pkg/llm/router.go (InvokeWithFallback: 大模型路由与熔断)
+   │                   │      └── pkg/llm/client.go (Invoke: 发起真实 HTTP 到大模型)
+   │                   └── 3. internal/model/db.go & pkg/cache/redis.go (记账入库扣额度)
+   │
+   └─► 【MQ 流】 cmd/worker/main.go
+           └── pkg/mq/consumer.go (KafkaConsumer.Start -> processMessage)
+                   ├── 1. pkg/cache/redis.go (CheckRPMLimit/TPMLimit: 消费端限流)
+                   ├── 2. pkg/tokenizer/tiktoken.go (CountTokens: 算长度)
+                   ├── 3. 【如果太长】-> pkg/tokenizer/splitter.go (切分)
+                   │                -> pkg/llm/mapreduce.go (ProcessLargeTask 分治处理)
+                   │                   └── pkg/llm/router.go (大模型路由)
+                   ├── 4. pkg/mq/consumer.go (handleCallback: 业务回调)
+                   │      └── pkg/callback/client.go (SendResult)
+                   └── 5. 【如果失败】-> pkg/mq/dlq.go (SendToDLQ: 发送重试/死信队列)
+*/

@@ -1,8 +1,10 @@
 package api
 
 import (
+	"ai-gateway/config"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -12,9 +14,9 @@ import (
 func SetupRouter(llmRouter *llm.LLMRouter,redisCache *cache.RedisCache) *gin.Engine {
 	r := gin.Default()
 
-	// 🌟 1. 挂载全局监控中间件 (记录所有请求)
+	//1. 挂载全局监控中间件 (记录所有请求)
 	r.Use(PrometheusMiddleware())
-	// 🌟 2. 暴露指标接口给 Prometheus 抓取
+	//2. 暴露指标接口给 Prometheus 抓取
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	
 	// 健康检查接口
@@ -31,5 +33,14 @@ func SetupRouter(llmRouter *llm.LLMRouter,redisCache *cache.RedisCache) *gin.Eng
 		// 注册聊天接口，把你的 llmRouter 传进去
 		v1.POST("/chat/completions", ChatHandler(llmRouter, redisCache)) // 传给 Handler
 	}
+	admin := r.Group("/api/v1/admin")
+    // 这里最好加一个单独的鉴权中间件，只允许管理员访问，这里暂略
+    {
+        brokers := strings.Split(config.GetEnv("KAFKA_BROKERS", "localhost:9092"), ",")
+        dlqTopic := config.GetEnv("KAFKA_DLQ_TOPIC", "ai_task_topic_dlq")
+        
+        // 挂载重试接口
+        admin.POST("/dlq/retry", RetryDLQHandler(dlqTopic, "ai_task_heavy_v3", brokers))
+    }
 	return r
 }

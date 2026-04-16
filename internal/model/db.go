@@ -64,7 +64,6 @@ func InitDB() {
 		// 🌟 3. 日志级别控制
 		// 生产环境下建议设为 Silent（静默）或 Error，防止控制台被密集的 SQL 日志刷屏导致性能下降。
 		Logger: logger.Default.LogMode(logger.Error),
-
 	})
 
 	if err != nil {

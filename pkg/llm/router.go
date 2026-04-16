@@ -27,9 +27,8 @@ func NewLLMRouter(providers ...Provider) *LLMRouter {
 			Interval:    10 * time.Second, // 定期清空计数器
 			Timeout:     10 * time.Second, // 熔断器开启后，多久进入半开状态尝试恢复
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
-				// 🌟 压测级抗压配置：
+				//压测级抗压配置：
 				// 至少得有 50 个请求进来，并且失败率超过 50%，才触发熔断！
-				// 这样就不会因为瞬间的 5 个网络抖动而误杀整个系统。
 				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
 				return counts.Requests >= 50 && failureRatio >= 0.5
 			},
@@ -53,7 +52,7 @@ func (r *LLMRouter) InvokeWithFallback(ctx context.Context, prompt string) (stri
 	for _, p := range r.providers {
 		cb := r.breakers[p.Name()]
 
-		// 🌟 1. 定义一个“书包”结构体，用来装我们要带出来的两个宝贝
+		//1. 定义一个“书包”结构体，用来装我们要带出来的两个宝贝
 		type resultWrapper struct {
 			content string
 			usage   Usage
