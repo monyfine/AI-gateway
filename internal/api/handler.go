@@ -4,10 +4,8 @@ import (
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
-	"ai-gateway/pkg/mq"
 	"ai-gateway/pkg/tokenizer"
 	"context"
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -217,19 +215,19 @@ func StatsHandler(redisCache *cache.RedisCache) gin.HandlerFunc{
 		})
 	}
 }
-// RetryDLQHandler 触发死信队列重试
+// RetryDLQHandler 触发死信队列重试 (基于 Header 架构升级版)
 func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		reader := kafka.NewReader(kafka.ReaderConfig{
 			Brokers: brokers,
 			Topic:   dlqTopic,
-			GroupID: "dlq_admin_recovery_group", 
+			GroupID: "dlq_admin_recovery_group",
 		})
 		defer reader.Close()
 
 		writer := &kafka.Writer{
 			Addr:         kafka.TCP(brokers...),
-			Topic:        targetTopic,
+			// 注意：这里去掉了固定的 Topic，因为我们要用代码动态指定，做到“从哪来回哪去”
 			RequiredAcks: kafka.RequireAll,
 		}
 		defer writer.Close()
@@ -240,21 +238,43 @@ func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.
 
 		for {
 			msg, err := reader.ReadMessage(ctx)
-			if err != nil { break } // 读完或超时退出
+			if err != nil {
+				break // 读完或者 10 秒没新消息就退出
+			}
 
-			var dlqMsg mq.DeadLetterMessage
-			if err := json.Unmarshal(msg.Value, &dlqMsg); err == nil {
-				// 重新投递回原来的主队列
-				writer.WriteMessages(context.Background(), kafka.Message{
-					Key:   msg.Key,
-					Value: []byte(dlqMsg.OriginalMessage), 
-				})
+			// 🌟 1. 智能路由：优先看看这消息原来是哪个队列的
+			actualTarget := targetTopic
+			for _, h := range msg.Headers {
+				if h.Key == "x-original-topic" && len(h.Value) > 0 {
+					actualTarget = string(h.Value)
+					break
+				}
+			}
+
+			// 🌟 2. 洗心革面：重置 Header 状态
+			// 给它全新的 Header，重置重试次数为 0，并打上人工干预的标记
+			newHeaders := []kafka.Header{
+				{Key: "x-retry-count", Value: []byte("0")},       // 清除重试历史
+				{Key: "x-is-recovered", Value: []byte("true")},   // 标记为人工恢复
+			}
+
+			// 🌟 3. 直接投递：不再需要 json.Unmarshal 拆包！
+			err = writer.WriteMessages(context.Background(), kafka.Message{
+				Topic:   actualTarget, // 精准打回原队列 (如 ai_task_fast)
+				Key:     msg.Key,
+				Value:   msg.Value,    // 直接原封不动把纯净的业务 JSON 发回去
+				Headers: newHeaders,
+			})
+
+			if err == nil {
 				recoveredCount++
+			} else {
+				log.Printf("❌ 人工恢复消息失败 [Offset: %d]: %v", msg.Offset, err)
 			}
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"message": "补偿执行完毕",
+			"message":         "死信队列补偿执行完毕",
 			"recovered_count": recoveredCount,
 		})
 	}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"strconv"
 
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
@@ -43,7 +44,7 @@ type TaskMessage struct {
 	Content  string `json:"content"`
 }
 
-// NewKafkaConsumer 初始化消费者 (注意新增了 retryTopic 参数)
+// NewKafkaConsumer 初始化消费者
 func NewKafkaConsumer(brokers []string, topic string, groupID string, router *llm.LLMRouter, cbClient *callback.CallbackClient, redisCache *cache.RedisCache, workerCount int, dlqTopic string, retryTopic string, maxRetry int) *KafkaConsumer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:     brokers,
@@ -93,6 +94,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 		if err != nil {
 			<-c.limitChan
 			if errors.Is(err, context.Canceled) {
+				//如果是系统CTRL+C了就直接返回，不过会先完成defer里面的东西return分两步
 				return
 			}
 			log.Printf("❌ 拉取消息失败: %v\n", err)
@@ -116,8 +118,10 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 
 // 🌟 核心处理逻辑
 func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
-	var task TaskMessage
+	// 1. 读取当前是第几次重试
+	currentRetryCount := getRetryCountFromHeader(msg.Headers)
 
+	var task TaskMessage
 	// ==========================================
 	// 阶段 1：解析与校验 (永久错误判定)
 	// ==========================================
@@ -140,7 +144,7 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	if !rpmAllowed || !tpmAllowed {
 		log.Printf("🚫 [限流] 租户 %s 触发流控(Redis/本地降级)，转入重试队列！", task.APIKey)
 		// 🌟 绝不 Sleep！立刻扔进重试队列，交出主线程控制权
-		c.sendToRetryAndCommit(msg, "触发租户级限流，等待系统额度恢复", 1)
+		c.sendToRetryAndCommit(msg, "触发租户级限流，等待系统额度恢复", 0)
 		return
 	}
 
@@ -188,19 +192,17 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 
 	if err != nil {
 		errStr := err.Error()
-
-		// 记录失败日志落库
 		c.recordDBLog(task, "", usage, "fail", errStr)
 		metrics.TasksTotal.WithLabelValues("fail").Inc()
 
-		// 1. 如果是 4xx 错误 (比如 400 提示词太长、401 欠费、403 内容涉政违规)
 		if strings.Contains(errStr, "状态码: 4") || strings.Contains(errStr, "invalid") {
-			c.sendToDLQAndCommit(msg, "大模型拒绝请求(4xx永久错误): "+errStr, 0)
+			// 4xx 永久错误 -> 进死信
+			c.sendToDLQAndCommit(msg, "大模型拒绝请求(4xx永久错误): "+errStr, currentRetryCount)
 			return
 		}
 
-		// 2. 如果是 5xx 错误或超时 (比如官方 API 宕机、网络抖动)
-		c.sendToRetryAndCommit(msg, "大模型网络异常(5xx临时错误): "+errStr, 1)
+		// 5xx 临时错误 -> 进重试 (注意：这里传入的是 currentRetryCount，内部会+1)
+		c.sendToRetryAndCommit(msg, "大模型网络异常(5xx临时错误): "+errStr, currentRetryCount)
 		return
 	}
 
@@ -253,12 +255,12 @@ func (c *KafkaConsumer) handleCallback(ctx context.Context, msg kafka.Message, t
 		}
 	}
 
-	// 🌟 主系统彻底挂了 (比如主业务服务器宕机)，这也是一种临时错误
+	// 主系统彻底挂了 (比如主业务服务器宕机)，这也是一种临时错误
 	// 把已经拿到 AI 结果的消息扔进重试队列，防止花了钱的 AI 答案丢失！
 	c.sendToDLQAndCommit(msg, "回调主系统彻底超时失败(需人工补偿)", c.maxRetry)
 }
 
-// --- 以下为 Kafka 提交与流转的核心方法 ---
+
 
 func (c *KafkaConsumer) commit(msg kafka.Message) {
 	commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -270,22 +272,24 @@ func (c *KafkaConsumer) commit(msg kafka.Message) {
 	}
 }
 
-// sendToDLQAndCommit 发送至【死信队列】，用于存放永久性错误
-func (c *KafkaConsumer) sendToDLQAndCommit(msg kafka.Message, reason string, retryCount int) {
+// sendToDLQAndCommit 发送至【死信队列】
+func (c *KafkaConsumer) sendToDLQAndCommit(msg kafka.Message, reason string, currentRetryCount int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.dlqProducer.SendToDLQ(ctx, msg, reason, retryCount); err != nil {
+    // 注意：死信代表终结，次数不需要再+1了
+	if err := c.dlqProducer.SendToQueue(ctx, msg, reason, currentRetryCount); err != nil {
 		log.Printf("❌ DLQ 投递失败，保留原消息 [Offset: %d]", msg.Offset)
 		return
 	}
 	c.commit(msg)
 }
 
-// sendToRetryAndCommit 🌟 发送至【延迟重试队列】，用于存放临时性错误
-func (c *KafkaConsumer) sendToRetryAndCommit(msg kafka.Message, reason string, retryCount int) {
+// sendToRetryAndCommit 发送至【延迟重试队列】
+func (c *KafkaConsumer) sendToRetryAndCommit(msg kafka.Message, reason string, currentRetryCount int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.retryProducer.SendToDLQ(ctx, msg, reason, retryCount); err != nil {
+    // 🌟 核心：进入重试队列，生命值（重试次数）+1
+	if err := c.retryProducer.SendToQueue(ctx, msg, reason, currentRetryCount+1); err != nil {
 		log.Printf("❌ 重试队列投递失败，保留原消息 [Offset: %d]", msg.Offset)
 		return
 	}
@@ -314,4 +318,24 @@ func (c *KafkaConsumer) Close() error {
 		c.retryProducer.Close()
 	}
 	return c.Reader.Close()
+}
+
+// 🌟 辅助函数：从 Header 读取重试次数
+func getRetryCountFromHeader(headers []kafka.Header) int {
+	val := getHeaderValue(headers, "x-retry-count")
+	if val == "" {
+		return 0
+	}
+	count, _ := strconv.Atoi(val)
+	return count
+}
+
+// 🌟 辅助函数：从 Header 读取指定 Key 的值
+func getHeaderValue(headers []kafka.Header, key string) string {
+	for _, h := range headers {
+		if h.Key == key {
+			return string(h.Value)
+		}
+	}
+	return ""
 }

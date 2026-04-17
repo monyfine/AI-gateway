@@ -23,14 +23,13 @@ func NewLLMRouter(providers ...Provider) *LLMRouter {
 		// 为每个供应商配置熔断器
 		st := gobreaker.Settings{
 			Name:        p.Name(),
-			MaxRequests: 100,              // 半开状态允许通过的请求数
-			Interval:    10 * time.Second, // 定期清空计数器
-			Timeout:     10 * time.Second, // 熔断器开启后，多久进入半开状态尝试恢复
+			MaxRequests: 5,              // 半开状态允许通过的请求数
+			Interval:    60 * time.Second, // 定期清空计数器
+			Timeout:     30 * time.Second, // 熔断器断开后，多久进入半开状态尝试恢复
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
-				//压测级抗压配置：
 				// 至少得有 50 个请求进来，并且失败率超过 50%，才触发熔断！
 				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-				return counts.Requests >= 50 && failureRatio >= 0.5
+				return counts.Requests >= 5 && failureRatio >= 0.6
 			},
 			OnStateChange: func(name string, from, to gobreaker.State) {
 				log.Printf("🚨 熔断器[%s] 状态变更: %v -> %v", name, from, to)
@@ -109,7 +108,7 @@ func (r *LLMRouter) InvokeWithFallback(ctx context.Context, prompt string) (stri
 	return "", Usage{}, fmt.Errorf("全线崩溃，最后错误: %w", lastErr)
 }
 
-// 🌟 修复后的流式路由
+// 流式路由
 func (r *LLMRouter) InvokeStreamWithFallback(ctx context.Context, prompt string) (<-chan StreamMessage, error) {
 	var lastErr error
 

@@ -1,5 +1,5 @@
 # 阶段 1：编译环境
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 ENV GO111MODULE=on \
     CGO_ENABLED=0 \
@@ -29,7 +29,7 @@ RUN apk add --no-cache tzdata && \
 # 把编译好的两个文件都拷过来
 COPY --from=builder /app/api-server .
 COPY --from=builder /app/worker-server .
-COPY --from=builder /app/.env . 
+# COPY --from=builder /app/.env . 
 
 # 暴露 API 端口
 EXPOSE 8080 9091

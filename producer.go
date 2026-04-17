@@ -26,7 +26,7 @@ func main() {
 	brokers :=[]string{"localhost:9092"} 
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(brokers...),
-		Topic:    "ai_task_heavy_v3", // 🌟🌟🌟 改成 v2 🌟🌟🌟
+		Topic:    "ai_task_heavy_v3", 
 		Balancer: &kafka.LeastBytes{},
 	}
 	defer writer.Close()

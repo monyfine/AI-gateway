@@ -2,69 +2,63 @@ package mq
 
 import (
 	"context"
-	"encoding/json"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
 
-type DeadLetterMessage struct {
-	OriginalMessage string    `json:"original_message"`
-	Topic           string    `json:"topic"`
-	Partition       int       `json:"partition"`
-	Offset          int64     `json:"offset"`
-	ErrorReason     string    `json:"error_reason"`
-	FailedAt        time.Time `json:"failed_at"`
-	RetryCount      int       `json:"retry_count"`
-}
-
+// DLQProducer 用于向重试或死信队列发送消息
 type DLQProducer struct {
 	writer *kafka.Writer
+	topic  string
 }
 
-// --- 在 pkg/mq/dlq.go 的 NewDLQProducer 函数中修改 ---
-func NewDLQProducer(brokers []string, dlqTopic string) *DLQProducer {
+func NewDLQProducer(brokers []string, topic string) *DLQProducer {
 	return &DLQProducer{
 		writer: &kafka.Writer{
-			Addr:                   kafka.TCP(brokers...),
-			Topic:                  dlqTopic,
-			Balancer:               &kafka.LeastBytes{},
-			RequiredAcks:           kafka.RequireAll,
-			Async:                  false,
-			AllowAutoTopicCreation: true, // 🌟 增加这一行，允许自动创建 DLQ 主题
+			Addr:         kafka.TCP(brokers...),
+			Topic:        topic,
+			Balancer:     &kafka.LeastBytes{},
+			RequiredAcks: kafka.RequireAll,
 		},
+		topic: topic,
 	}
 }
 
-func (d *DLQProducer) SendToDLQ(ctx context.Context, originalMsg kafka.Message, reason string, retryCount int) error {
-	dlqMsg := DeadLetterMessage{
-		OriginalMessage: string(originalMsg.Value),
-		Topic:           originalMsg.Topic,
-		Partition:       originalMsg.Partition,
-		Offset:          originalMsg.Offset,
-		ErrorReason:     reason,
-		FailedAt:        time.Now(),
-		RetryCount:      retryCount,
-	}
-
-	payload, err := json.Marshal(dlqMsg)
-	if err != nil {
-		return err
-	}
-	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+// SendToQueue 统一发送函数，利用 Header 传递重试状态
+func (d *DLQProducer) SendToQueue(ctx context.Context, originalMsg kafka.Message, reason string, nextRetryCount int) error {
+	writeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err = d.writer.WriteMessages(writeCtx, kafka.Message{
-		Key:  originalMsg.Key,
-		Value: payload,
+	// 🌟 核心修改：业务数据原封不动，状态信息全部写入 Header
+	// 如果 originalMsg 之前没有 x-original-topic，说明是第一次失败，我们把它当前的 Topic 记录下来
+	originalTopic := getHeaderValue(originalMsg.Headers, "x-original-topic")
+	if originalTopic == "" {
+		originalTopic = originalMsg.Topic
+	}
+
+	// 构造新的 Headers，覆盖旧的重试信息
+	headers := []kafka.Header{
+		{Key: "x-retry-count", Value: []byte(strconv.Itoa(nextRetryCount))},
+		{Key: "x-error-reason", Value: []byte(reason)},
+		{Key: "x-original-topic", Value: []byte(originalTopic)},
+		{Key: "x-failed-at", Value: []byte(strconv.FormatInt(time.Now().Unix(), 10))},
+	}
+
+	err := d.writer.WriteMessages(writeCtx, kafka.Message{
+		Key:     originalMsg.Key,
+		Value:   originalMsg.Value, // 纯净的业务 JSON，不加任何包装
+		Headers: headers,
 	})
 
 	if err != nil {
-		log.Printf("❌ 发送到 DLQ 失败 [Offset: %d]: %v", originalMsg.Offset, err)
+		log.Printf("❌ 发送到队列 [%s] 失败 [Offset: %d]: %v", d.topic, originalMsg.Offset, err)
 		return err
 	}
-	log.Printf("📤 消息已转入死信队列 [Offset: %d], 原因: %s", originalMsg.Offset, reason)
+
+	log.Printf("📤 消息已转入队列 [%s] [Offset: %d], 当前重试次数: %d, 原因: %s", d.topic, originalMsg.Offset, nextRetryCount, reason)
 	return nil
 }
 

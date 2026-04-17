@@ -1,0 +1,16 @@
+# 必须忽略，否则会触发 mysql.sock 错误
+mysql_data/
+
+# 忽略本地编译产物，防止干扰镜像内的 Linux 编译
+*.exe
+ai-gateway
+api-server
+worker-server
+
+# 忽略本地依赖，让 Docker 在容器内重新下载干净的依赖
+vendor/
+
+# 其他杂项
+.env
+.git/
+.vscode/

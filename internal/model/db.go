@@ -4,6 +4,7 @@ import (
 	"ai-gateway/config"
 	"log"
 	"time"
+	// "fmt"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -45,7 +46,7 @@ type RequestLog struct {
 // InitDB 初始化数据库连接
 func InitDB() {
 	dsn := config.GetEnv("DB_DSN", "")
-
+	// fmt.Println(dsn)
 	if dsn == "" {
 		log.Fatal("❌ 数据库配置 DB_DSN 为空")
 	}

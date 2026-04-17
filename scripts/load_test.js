@@ -12,10 +12,11 @@ export default function () {
     
     // 🌟 核心开关：
     // 如果你想测【缓存穿透】(打满 MySQL 和 LLM)，取消下面这行的注释：
-     const promptText = `你好，这是一个固定的测试问题，测试缓存命中率`;
+    //  const promptText = `你好，这是一个固定的测试问题，测试缓存命中率`;
     
     // 如果你想测【缓存命中】(打满 Redis)，取消下面这行的注释，注释掉上面那行：
     // const promptText = `你好，这是一个固定的测试问题`; 
+    const promptText = `压测随机问题_${uuidv4()}`;
 
     const payload = JSON.stringify({
         prompt: promptText,

@@ -22,7 +22,7 @@ type Usage struct {
 // Provider 定义模型供应商接口
 type Provider interface {
 	Name() string
-	Invoke(ctx context.Context, prompt string) (string, Usage, error) // 🌟 增加 Usage 返回
+	Invoke(ctx context.Context, prompt string) (string, Usage, error) //增加 Usage 返回
 	InvokeStream(ctx context.Context, prompt string) (<-chan StreamMessage, error)
 }
 
@@ -30,13 +30,12 @@ type Provider interface {
 type BaseClient struct {
 	name       string
 	client     *resty.Client
-	httpClient *http.Client // 🌟 新增：用于流式请求的原生 HTTP 客户端
+	httpClient *http.Client //新增：用于流式请求的原生 HTTP 客户端
 	apiKey     string
 	apiURL     string
 	model      string
 }
 
-// 🌟 新增：用于在 Channel 中传递流式数据和计费信息
 type StreamMessage struct {
 	Content string
 	Usage   *Usage // 只有流式输出的最后一块，这个字段才会有值
@@ -44,7 +43,7 @@ type StreamMessage struct {
 
 func NewBaseClient(name, url, key, model string) *BaseClient {
 	restyCli := resty.New()
-	restyCli.SetTimeout(30 * time.Second)
+	restyCli.SetTimeout(300 * time.Second)
 	return &BaseClient{
 		name:   name,
 		client: restyCli,
@@ -76,7 +75,7 @@ func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, 
 		Post(c.apiURL)
 
 	if err != nil {
-		// 🌟 报错时也要返回空的 Usage
+		//报错时也要返回空的 Usage
 		return "", Usage{}, fmt.Errorf("network error: %v", err)
 	}
 
@@ -85,14 +84,14 @@ func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, 
 	}
 
 	if len(result.Choices) > 0 {
-		// 🌟 成功：返回内容和解析出来的 Usage
+		//成功：返回内容和解析出来的 Usage
 		return result.Choices[0].Message.Content, result.Usage, nil
 	}
 
 	return "", Usage{}, fmt.Errorf("no response from AI")
 }
 
-// 🌟 修复后的流式调用实现
+//流式调用实现
 func (c *BaseClient) InvokeStream(ctx context.Context, prompt string) (<-chan StreamMessage, error) {
 	reqBody := map[string]interface{}{
 		"model": c.model,
@@ -176,7 +175,6 @@ func (c *BaseClient) InvokeStream(ctx context.Context, prompt string) (<-chan St
 	return ch, nil
 }
 
-// Request 和 Response 结构体保持不变...
 type Request struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
@@ -191,5 +189,5 @@ type Response struct {
 	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
-	Usage Usage `json:"usage"` // 🌟 新增：捕获 Token 使用情况
+	Usage Usage `json:"usage"` //捕获 Token 使用情况
 }

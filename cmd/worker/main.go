@@ -81,11 +81,18 @@ func main() {
 	workerMode := config.GetEnv("WORKER_MODE", "all") // 读取环境变量
 
 	if workerMode == "all" || workerMode == "fast" {
+		go fastConsumer.ReportStats(ctx)
 		go fastConsumer.Start(ctx)
 	}
 
 	if workerMode == "all" || workerMode == "heavy" {
+		go heavyConsumer.ReportStats(ctx) 
 		go heavyConsumer.Start(ctx)
+	}
+	// 🌟 新增：启动独立的重试调度中心
+	if workerMode == "all" || workerMode == "retry" {
+		// 参数：broker列表, 监听的重试Topic, 最终的死信Topic, 最大允许重试次数(如 3 次)
+		go mq.StartRetryDispatcher(brokers, retryTopic, dlqTopic, 3)
 	}
 
 	// ==========================================

@@ -7,13 +7,13 @@ import (
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
+	"context" // 🌟 新增
 	"log"
-	"time"
 	"net/http"  // 🌟 新增
 	"os"        // 🌟 新增
 	"os/signal" // 🌟 新增
 	"syscall"   // 🌟 新增
-	"context"   // 🌟 新增
+	"time"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func main() {
 	)
 	llmRouter := llm.NewLLMRouter(primaryProvider, fallbackProvider)
 	redisCache := cache.NewRedisCache(24 * time.Hour)
-	
+
 	r := api.SetupRouter(llmRouter, redisCache)
 	port := config.GetEnv("API_PORT", ":8080")
 
@@ -44,18 +44,18 @@ func main() {
 		Addr:    port,
 		Handler: r,
 	}
-	go func(){
+	go func() {
 		log.Printf("✅ API 服务已启动，监听端口 %s", port)
 		// ErrServerClosed 是正常关闭的信号，不需要报错
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("❌ 服务启动失败: %v", err)
 		}
 	}()
-	
+
 	// 3. 设置系统信号监听
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM) // 捕获 Ctrl+C 和 kill 信号
-	<-quit // 阻塞在这里，直到收到系统信号
+	<-quit                                               // 阻塞在这里，直到收到系统信号
 
 	log.Println("⚠️ 接收到关闭信号，准备优雅停机，不再接收新请求...")
 
@@ -69,25 +69,3 @@ func main() {
 
 	log.Println("✅ API 服务已安全、平滑地退出")
 }
-/*
-[发起方]
-   │
-   ├─► 【API 流】 cmd/api/main.go -> internal/api/router.go
-   │       └── internal/api/middleware.go (AuthMiddleware: 鉴权与 Redis 限流)
-   │           └── internal/api/handler.go (ChatHandler: 业务逻辑中心)
-   │                   ├── 1. pkg/cache/redis.go (GetCachedResponse: 查缓存)
-   │                   ├── 2. pkg/llm/router.go (InvokeWithFallback: 大模型路由与熔断)
-   │                   │      └── pkg/llm/client.go (Invoke: 发起真实 HTTP 到大模型)
-   │                   └── 3. internal/model/db.go & pkg/cache/redis.go (记账入库扣额度)
-   │
-   └─► 【MQ 流】 cmd/worker/main.go
-           └── pkg/mq/consumer.go (KafkaConsumer.Start -> processMessage)
-                   ├── 1. pkg/cache/redis.go (CheckRPMLimit/TPMLimit: 消费端限流)
-                   ├── 2. pkg/tokenizer/tiktoken.go (CountTokens: 算长度)
-                   ├── 3. 【如果太长】-> pkg/tokenizer/splitter.go (切分)
-                   │                -> pkg/llm/mapreduce.go (ProcessLargeTask 分治处理)
-                   │                   └── pkg/llm/router.go (大模型路由)
-                   ├── 4. pkg/mq/consumer.go (handleCallback: 业务回调)
-                   │      └── pkg/callback/client.go (SendResult)
-                   └── 5. 【如果失败】-> pkg/mq/dlq.go (SendToDLQ: 发送重试/死信队列)
-*/

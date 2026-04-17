@@ -11,5 +11,5 @@ func main() {
 		// 模拟返回 OpenAI 格式的数据，包含 Usage
 		w.Write([]byte(`{"choices":[{"message":{"content":"这是Mock的AI回答"}}],"usage":{"prompt_tokens":10,"completion_tokens":10,"total_tokens":20}}`))
 	})
-	http.ListenAndServe(":9999", nil)
+	http.ListenAndServe(":8081", nil)
 }

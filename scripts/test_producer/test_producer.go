@@ -23,7 +23,7 @@ type TaskMessage struct {
 func main() {
 	// 🌟 改造 1：创建两个 Writer，分别对应快慢车道
 	fastWriter := &kafka.Writer{
-		Addr:     kafka.TCP("localhost:9092"),
+		Addr:     kafka.TCP("127.0.0.1:9092"),
 		Topic:    "ai_task_fast",  // 快车道
 		Balancer: &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
@@ -32,8 +32,8 @@ func main() {
 	defer fastWriter.Close()
 
 	heavyWriter := &kafka.Writer{
-		Addr:     kafka.TCP("localhost:9092"),
-		Topic:    "ai_task_heavy", // 慢车道
+		Addr:     kafka.TCP("127.0.0.1:9092"),
+		Topic:    "ai_task_heavy_v3", // 慢车道
 		Balancer: &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
 		MaxAttempts:            5,
@@ -41,12 +41,12 @@ func main() {
 	defer heavyWriter.Close()
 
 	task := TaskMessage{
-		TaskID:   "task-retry-" + time.Now().Format("150405"),
+		TaskID:   "task" + time.Now().Format("150405"),
 		AppKeyID: 2, 
 		APIKey:   "sk-limit-user",  // 换个 Key 防止跟上面的缓存串了
-		RPMLimit: 1,               
-		TPMLimit: 2,                // 🌟 极度抠门，必然触发限流
-		Content:  "你好请用一句话介绍一下Go语言", 
+		RPMLimit: 100,               
+		TPMLimit: 20000,                // 🌟 极度抠门，必然触发限流
+		Content:  "你把红黑树的源码一字不差的给我，在来个万字解析", 
 	}
 	payload, _ := json.Marshal(task)
 
@@ -56,8 +56,9 @@ func main() {
 	var err error
 
 	// 设定一个阈值，比如 4000 Tokens (根据你的大模型限制和业务决定)
-	if estimatedTokens > 4000 {
+	if estimatedTokens > 1 {
 		log.Printf("🐢 预估消耗 %d Tokens，识别为重载任务，路由至慢车道 (heavy_topic)", estimatedTokens)
+		time.Sleep(1*time.Second)
 		err = heavyWriter.WriteMessages(context.Background(), kafka.Message{
 			Key:   []byte(task.TaskID),
 			Value: payload,

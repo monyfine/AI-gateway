@@ -22,6 +22,7 @@ type cachedApp struct {
 
 var (
 	authCache sync.Map
+	//用map容易导致读写冲突
 	sfGroup   singleflight.Group // 🌟 新增：用于防缓存击穿
 )
 
