@@ -242,7 +242,6 @@ func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.
 				break // 读完或者 10 秒没新消息就退出
 			}
 
-			// 🌟 1. 智能路由：优先看看这消息原来是哪个队列的
 			actualTarget := targetTopic
 			for _, h := range msg.Headers {
 				if h.Key == "x-original-topic" && len(h.Value) > 0 {
@@ -251,7 +250,6 @@ func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.
 				}
 			}
 
-			// 🌟 2. 洗心革面：重置 Header 状态
 			// 给它全新的 Header，重置重试次数为 0，并打上人工干预的标记
 			newHeaders := []kafka.Header{
 				{Key: "x-retry-count", Value: []byte("0")},       // 清除重试历史

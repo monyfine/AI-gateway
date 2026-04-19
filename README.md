@@ -1,6 +1,8 @@
 # 🚀 Enterprise AI Gateway (高可用大模型网关)
 
 基于 Golang 开发的企业级大模型调度与分发网关，致力于解决多租户高并发场景下的限流防刷、超长文本超时、以及昂贵算力成本控制等核心痛点。
+## 🏗️ 系统架构 / Architecture
+![高可用大模型网关架构图](./assets/architecture.png)
 
 ## ✨ 核心特性 / Core Features
 

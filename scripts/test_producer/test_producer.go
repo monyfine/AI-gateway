@@ -56,7 +56,7 @@ func main() {
 	var err error
 
 	// 设定一个阈值，比如 4000 Tokens (根据你的大模型限制和业务决定)
-	if estimatedTokens > 1 {
+	if estimatedTokens > 4000 {
 		log.Printf("🐢 预估消耗 %d Tokens，识别为重载任务，路由至慢车道 (heavy_topic)", estimatedTokens)
 		time.Sleep(1*time.Second)
 		err = heavyWriter.WriteMessages(context.Background(), kafka.Message{

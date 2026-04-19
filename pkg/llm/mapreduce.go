@@ -7,7 +7,6 @@ import (
 	"sync"
 )
 
-// 🌟 核心修复：定义一个接口，打破循环依赖 (依赖倒置)
 // llm 包不关心具体的缓存实现，只要满足这两个方法的对象都能传进来
 type SubTaskCache interface {
 	GetCachedResponse(prompt string) (string, bool)
@@ -126,7 +125,7 @@ func (e *MapReduceEngine) executeBatch(ctx context.Context, instruction string, 
 %s`, instruction, text)
 			}
 
-			// 🌟 核心优化：子任务断点续传 (查缓存)
+			//核心优化：子任务断点续传 (查缓存)
 			if cachedRes, ok := e.cache.GetCachedResponse(prompt); ok {
 				mu.Lock()
 				results[index] = cachedRes
