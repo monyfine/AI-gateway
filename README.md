@@ -32,6 +32,7 @@ cp .env.example .env
 docker-compose up -d --build
 
 ## 🏗️ 架构数据流图 (Architecture & Data Flow)
+```mermaid
 graph TD
     %% 定义外部系统
     Client([客户端 / 业务前端])
@@ -85,3 +86,4 @@ graph TD
     classDef storage fill:#fff3e0,stroke:#e65100,stroke-width:2px;
     class API,Router,Worker,DLQ_Compensator gateway;
     class Redis,Kafka_Queue,Kafka_DLQ,MySQL storage;
+```
