@@ -40,36 +40,36 @@ graph TD
     LLM_Providers((多模型供应商 DeepSeek/Qwen 等))
 
     %% AI Gateway 核心模块
-    subgraph AI Gateway
-        API[API Handler (Gin)]
-        Router[LLM Router (熔断与重试策略)]
-        Worker[Async Worker (长文本滑动窗口)]
-        DLQ_Compensator[Retry DLQ Handler (死信补偿)]
+    subgraph GatewayLayer [AI Gateway]
+        API[API Handler - Gin]
+        Router[LLM Router - 熔断与重试]
+        Worker[Async Worker - 长文本滑动窗口]
+        DLQ_Compensator[Retry DLQ - 死信补偿]
     end
 
     %% 存储层与中间件
-    subgraph Middleware & Storage
+    subgraph MiddlewareLayer [Middleware & Storage]
         Redis[(Redis)]
         Kafka_Queue{Kafka: Fast/Slow Topic}
         Kafka_DLQ{Kafka: Dead Letter Queue}
         MySQL[(MySQL DB)]
     end
 
-    %% 1. 快车道 (Sync/Stream) 数据流
+    %% 1. 快车道数据流
     Client -- 1. 同步/流式对话请求 --> API
     API -- 2. 限流校验 & 查询缓存 --> Redis
     Redis -. 3a. 命中缓存直接返回 .-> API
     
     API -- 3b. 未命中交由路由 --> Router
     Router -- 4. 熔断判定 & API调用 --> LLM_Providers
-    LLM_Providers -- 5. 结果/流式推送 (SSE) --> Router
-    Router -- 6. 返回数据给控制器 --> API
+    LLM_Providers -- 5. 结果/流式推送 SSE --> Router
+    Router -- 6. 返回数据 --> API
     API -- 7. 返回结果给前端 --> Client
     API -. 8a. 异步计费/审计日志 .-> MySQL
     API -. 8b. 异步更新缓存&扣费 .-> Redis
 
-    %% 2. 慢车道 (Async Worker) 数据流
-    Client -- 提交超长文本解析任务 --> API
+    %% 2. 慢车道数据流
+    Client -- 提交长文本解析任务 --> API
     API -- 发送长任务消息 --> Kafka_Queue
     Kafka_Queue -- 消费任务 --> Worker
     Worker -- 调用路由请求大模型 --> Router
