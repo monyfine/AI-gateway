@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync" // 🌟 新增
-	"time" // 🌟 新增
+	"sync"
+	"time"
 	"math/rand"
 
 	"github.com/gin-gonic/gin"
@@ -23,7 +23,7 @@ type cachedApp struct {
 var (
 	authCache sync.Map
 	//用map容易导致读写冲突
-	sfGroup   singleflight.Group // 🌟 新增：用于防缓存击穿
+	sfGroup   singleflight.Group //用于防缓存击穿
 )
 
 // 提取一个生成随机过期时间的辅助函数
@@ -37,11 +37,12 @@ func generateTTL() time.Time {
 func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
+		//HasPrefix 判断是非常是否一个字符串开头，返回布尔值
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "缺少 Authorization 请求头"})
 			return
 		}
-
+		//TrimPrefix去掉字符串前缀，返回剩余部分
 		apiKey := strings.TrimPrefix(authHeader, "Bearer ")
 		var app model.AppKey
 		needQueryDB := true
@@ -49,12 +50,12 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 		// 1. 先查本地缓存
 		if val, ok := authCache.Load(apiKey); ok {
 			cached := val.(cachedApp)
-			
+			//判断是否过期
 			if time.Now().Before(cached.ExpiresAt) {
 				app = cached.App
 				needQueryDB = false
 				
-				// 假设总有效期是 5 分钟。只有当剩余有效期不足 2 分钟时，才给它续命。
+				// 总有效期是 5 分钟。只有当剩余有效期不足 2 分钟时，才给它续命。
 				// 这样 1000 个并发请求过来，只要它还处于充足的有效期内，就不会触发任何 Store 写入！
 				if time.Until(cached.ExpiresAt) < 2*time.Minute {
 					authCache.Store(apiKey, cachedApp{
@@ -70,13 +71,13 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 
 		// 2. 如果缓存未命中或已过期，使用 singleflight 合并并发请求
 		if needQueryDB {
-			// 🌟 改造点：不管有多少个并发请求到达这里，同一个 apiKey 同一时刻只会执行一次内部的函数
+			//不管有多少个并发请求到达这里，同一个apiKey同一时刻只会执行一次内部的函数
 			v, err, _ := sfGroup.Do(apiKey, func() (interface{}, error) {
 				var dbApp model.AppKey
 				if err := model.DB.Where("`key` = ? AND status = 1", apiKey).First(&dbApp).Error; err != nil {
 					return nil, err
 				}
-				// 查到了，存入本地缓存，设置 5 分钟过期
+				//查到了，存入本地缓存，设置 5 分钟过期
 				authCache.Store(apiKey, cachedApp{
 					App:       dbApp,
 					ExpiresAt: generateTTL(), // 加上随机防雪崩时间

@@ -3,23 +3,19 @@ package config
 import (
 	"log"
 	"os"
-	// "fmt"
 
 	"github.com/joho/godotenv"
 )
 
-// LoadConfig 加载配置
+// LoadConfig loads environment variables from the local .env file when present.
 func LoadConfig() {
-	// 加载 .env 文件到环境变量
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("Warning: .env file not found, using system env")
+	if err := godotenv.Load(); err != nil {
+		log.Println("warning: .env file not found, using system env")
 	}
 }
 
-// GetEnv 获取配置，支持默认值
+// GetEnv returns the configured value or the provided default.
 func GetEnv(key, defaultValue string) string {
-	// fmt.Println("fsdfsf")
 	value := os.Getenv(key)
 	if value == "" {
 		return defaultValue

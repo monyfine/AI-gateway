@@ -4,13 +4,16 @@ import (
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
+	"ai-gateway/pkg/mq"
 	"ai-gateway/pkg/tokenizer"
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+	"fmt"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -22,8 +25,28 @@ type ChatRequest struct {
 	Stream bool   `json:"stream"`
 }
 
+func sendTaskToKafka(ctx context.Context, brokers []string, topic string, task mq.TaskMessage) error {
+	payload, err := json.Marshal(task)
+	if err != nil {
+		return err
+	}
+
+	writer := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Topic:        topic,
+		Balancer:     &kafka.LeastBytes{},
+		RequiredAcks: kafka.RequireAll,
+	}
+	defer writer.Close()
+
+	return writer.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(task.TaskID),
+		Value: payload,
+	})
+}
+
 // ChatHandler 处理同步的 AI 请求
-func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.HandlerFunc {
+func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []string, fastTopic string, heavyTopic string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req ChatRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -38,19 +61,18 @@ func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.Handler
 		// ==========================================
 		// 🌟 场景 A：前端请求流式输出 (Stream: true)
 		// ==========================================
+		fmt.Println(req.Stream)
 		if req.Stream {
 			c.Writer.Header().Set("Content-Type", "text/event-stream")
 			c.Writer.Header().Set("Cache-Control", "no-cache")
 			c.Writer.Header().Set("Connection", "keep-alive")
 
-			// 缓存命中时，模拟流式输出
 			if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
 				c.SSEvent("message", cachedResult)
 				c.SSEvent("message", "[DONE]")
 				return
 			}
 
-			// 调用流式路由
 			ch, err := router.InvokeStreamWithFallback(c.Request.Context(), req.Prompt)
 			if err != nil {
 				c.SSEvent("error", err.Error())
@@ -60,14 +82,12 @@ func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.Handler
 			var fullResponse strings.Builder
 			var finalUsage llm.Usage
 
-			// 实时推送数据
 			c.Stream(func(w io.Writer) bool {
 				msg, ok := <-ch
 				if !ok {
 					c.SSEvent("message", "[DONE]")
-					return false // channel 关闭，结束流
+					return false
 				}
-
 				if msg.Content != "" {
 					fullResponse.WriteString(msg.Content)
 					c.SSEvent("message", msg.Content)
@@ -78,7 +98,6 @@ func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.Handler
 				return true
 			})
 
-			// 异步保存计费与缓存
 			finalText := fullResponse.String()
 			go func() {
 				var total, promptTokens, compTokens int
@@ -90,7 +109,6 @@ func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.Handler
 					total = finalUsage.TotalTokens
 					status = "success_stream"
 				} else {
-					log.Printf("⚠️ 任务 [%s] 客户端异常断开，触发本地 Tiktoken Fallback 计费", taskID)
 					promptTokens = tokenizer.CountTokens(req.Prompt)
 					compTokens = tokenizer.CountTokens(finalText)
 					total = promptTokens + compTokens
@@ -118,63 +136,71 @@ func ChatHandler(router *llm.LLMRouter,redisCache *cache.RedisCache) gin.Handler
 		}
 
 		// ==========================================
-		// 场景 B：非流式输出
+		// 🌟 场景 B：非流式输出 (改造为异步投递到 Kafka)
 		// ==========================================
+		// 1. 先查缓存，如果有直接返回
 		if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
 			log.Printf("💰 [同步接口] 缓存命中，0 延迟返回！")
-			
-			// 记录一条 0 消耗的日志
+
 			logEntry := model.RequestLog{
 				AppKeyID: app.ID,
-				TaskID:   uuid.New().String(),
+				TaskID:   taskID,
 				Prompt:   req.Prompt,
 				Response: cachedResult,
-				Status:   "success_cached", // 标记为走缓存成功的
+				Status:   "success_cached",
 			}
 			model.DB.Create(&logEntry)
 
 			c.JSON(http.StatusOK, gin.H{
 				"task_id": logEntry.TaskID,
 				"content": cachedResult,
-				"usage":   llm.Usage{}, // 缓存命中，消耗为 0
-				"cached":  true,        // 告诉前端这是缓存结果
+				"usage":   llm.Usage{},
+				"cached":  true,
 			})
 			return
 		}
-		aiResult, usage, err := router.InvokeWithFallback(c.Request.Context(), req.Prompt)
-		logEntry := model.RequestLog{
-			AppKeyID:         app.ID,
-			TaskID:           uuid.New().String(), // 生成一个追踪ID
-			Prompt:           req.Prompt,
-			PromptTokens:     usage.PromptTokens,
-			CompletionTokens: usage.CompletionTokens,
-			TotalTokens:      usage.TotalTokens,
+
+		// 2. 构造要发往 Kafka 的任务消息
+		taskMsg := mq.TaskMessage{
+			TaskID:   taskID,
+			AppKeyID: app.ID,
+			APIKey:   app.Key,
+			RPMLimit: app.RPMLimit,
+			TPMLimit: app.TPMLimit,
+			Content:  req.Prompt,
 		}
 
-		if err != nil {
-			logEntry.Status = "fail"
-			logEntry.ErrorMsg = err.Error()
-			model.DB.Create(&logEntry)
+		// 3. 智能路由：根据 Token 数量决定进哪个队列
+		tokenCount := tokenizer.CountTokens(req.Prompt)
+		targetTopic := fastTopic
+		if tokenCount > 40 {
+			targetTopic = heavyTopic
+		}
 
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "AI 处理失败", "details": err.Error()})
+		// 4. 投递到 Kafka
+		err := sendTaskToKafka(c.Request.Context(), brokers, targetTopic, taskMsg)
+		if err != nil {
+			log.Printf("❌ 任务投递 Kafka 失败: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "系统繁忙，任务提交失败"})
 			return
 		}
 
-		// 成功记录
-		logEntry.Status = "success"
-		logEntry.Response = aiResult
+		// 5. 记录一条初始状态的日志，方便后续追踪
+		logEntry := model.RequestLog{
+			AppKeyID: app.ID,
+			TaskID:   taskID,
+			Prompt:   req.Prompt,
+			Status:   "pending", // 标记为排队处理中
+		}
 		model.DB.Create(&logEntry)
 
-		_ = redisCache.SetCachedResponse(req.Prompt, aiResult)
-		
-		// 🌟 新增：累加 TPM 消耗
-		redisCache.AddTPMUsage(app.Key, usage.TotalTokens)
+		log.Printf("📤 任务 [%s] 已成功投递至 Kafka 队列 [%s], Token预估: %d", taskID, targetTopic, tokenCount)
 
-		// 返回给前端
-		c.JSON(http.StatusOK, gin.H{
-			"task_id": logEntry.TaskID,
-			"content": aiResult,
-			"usage":   usage,
+		// 6. 立即向前端返回 202 Accepted，告知任务已受理
+		c.JSON(http.StatusAccepted, gin.H{
+			"task_id": taskID,
+			"status":  "processing",
+			"message": "任务已提交至后台队列处理，请等待回调通知",
 		})
 	}
 }
@@ -201,11 +227,11 @@ func CallbackHandler() gin.HandlerFunc {
 }
 
 // StatsHandler 返回 JSON 格式的全局统计数据
-func StatsHandler(redisCache *cache.RedisCache) gin.HandlerFunc{
+func StatsHandler(redisCache *cache.RedisCache) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		stats, err := redisCache.GetGlobalTokenStats()
-		if err != nil{
-			c.JSON(http.StatusInternalServerError,gin.H{"error":"获取统计数据失败"})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "获取统计数据失败"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
@@ -215,6 +241,7 @@ func StatsHandler(redisCache *cache.RedisCache) gin.HandlerFunc{
 		})
 	}
 }
+
 // RetryDLQHandler 触发死信队列重试 (基于 Header 架构升级版)
 func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -226,7 +253,7 @@ func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.
 		defer reader.Close()
 
 		writer := &kafka.Writer{
-			Addr:         kafka.TCP(brokers...),
+			Addr: kafka.TCP(brokers...),
 			// 注意：这里去掉了固定的 Topic，因为我们要用代码动态指定，做到“从哪来回哪去”
 			RequiredAcks: kafka.RequireAll,
 		}
@@ -252,15 +279,15 @@ func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.
 
 			// 给它全新的 Header，重置重试次数为 0，并打上人工干预的标记
 			newHeaders := []kafka.Header{
-				{Key: "x-retry-count", Value: []byte("0")},       // 清除重试历史
-				{Key: "x-is-recovered", Value: []byte("true")},   // 标记为人工恢复
+				{Key: "x-retry-count", Value: []byte("0")},     // 清除重试历史
+				{Key: "x-is-recovered", Value: []byte("true")}, // 标记为人工恢复
 			}
 
 			// 🌟 3. 直接投递：不再需要 json.Unmarshal 拆包！
 			err = writer.WriteMessages(context.Background(), kafka.Message{
 				Topic:   actualTarget, // 精准打回原队列 (如 ai_task_fast)
 				Key:     msg.Key,
-				Value:   msg.Value,    // 直接原封不动把纯净的业务 JSON 发回去
+				Value:   msg.Value, // 直接原封不动把纯净的业务 JSON 发回去
 				Headers: newHeaders,
 			})
 

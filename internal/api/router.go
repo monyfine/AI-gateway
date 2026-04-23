@@ -26,17 +26,21 @@ func SetupRouter(llmRouter *llm.LLMRouter,redisCache *cache.RedisCache) *gin.Eng
 
 	r.GET("/api/v1/stats", StatsHandler(redisCache))
 	r.POST("/api/v1/articles/callback", CallbackHandler())
+
+	brokers := strings.Split(config.GetEnv("KAFKA_BROKERS", "localhost:9092"), ",")
+	fastTopic := config.GetEnv("KAFKA_FAST_TOPIC", "ai_task_fast")
+	heavyTopic := config.GetEnv("KAFKA_HEAVY_TOPIC", "ai_task_heavy_v3")
+
 	// V1 版本 API 路由组
 	v1 := r.Group("/v1")
 	v1.Use(AuthMiddleware(redisCache)) //挂载鉴权中间件
 	{
 		// 注册聊天接口，把你的 llmRouter 传进去
-		v1.POST("/chat/completions", ChatHandler(llmRouter, redisCache)) // 传给 Handler
+		v1.POST("/chat/completions", ChatHandler(llmRouter, redisCache, brokers, fastTopic, heavyTopic)) // 传给 Handler
 	}
 	admin := r.Group("/api/v1/admin")
     // 这里最好加一个单独的鉴权中间件，只允许管理员访问，这里暂略
     {
-        brokers := strings.Split(config.GetEnv("KAFKA_BROKERS", "localhost:9092"), ",")
         dlqTopic := config.GetEnv("KAFKA_DLQ_TOPIC", "ai_task_topic_dlq")
         
         // 挂载重试接口
