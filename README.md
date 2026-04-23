@@ -25,10 +25,3 @@
 ## 🛠️ 技术栈
 Golang 1.22 | Gin | Redis (Lua) | Kafka | MySQL | GORM | Prometheus | Docker
 
-## 🚀 快速启动
-```bash
-# 1. 复制环境变量
-cp .env.example .env
-
-# 2. 一键启动基础设施与网关节点
-docker-compose up -d --build
