@@ -63,7 +63,7 @@ func main() {
 		}
 	}()
 
-	// 🌟 核心修改：给 GroupID 增加后缀
+	//给 GroupID 增加后缀
 	fastConsumer := mq.NewKafkaConsumer(
 		brokers, "ai_task_fast", groupID+"_fast", // 独立组 ID
 		llmRouter, callbackClient, redisCache, 10, dlqTopic, retryTopic, 3,
@@ -89,15 +89,13 @@ func main() {
 		go heavyConsumer.ReportStats(ctx) 
 		go heavyConsumer.Start(ctx)
 	}
-	// 🌟 新增：启动独立的重试调度中心
+	//启动独立的重试调度中心
 	if workerMode == "all" || workerMode == "retry" {
 		// 参数：broker列表, 监听的重试Topic, 最终的死信Topic, 最大允许重试次数(如 3 次)
 		go mq.StartRetryDispatcher(brokers, retryTopic, dlqTopic, 3)
 	}
 
-	// ==========================================
 	// 优雅停机逻辑 (完美兼容双消费者)
-	// ==========================================
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	sig := <-sigChan
@@ -119,5 +117,4 @@ func main() {
 }
 
 /*
-OUIVPWEWIEPPL6HM
  */

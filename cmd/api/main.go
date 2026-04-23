@@ -7,13 +7,14 @@ import (
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
-	"context" // 🌟 新增
+	"context"
 	"log"
-	"net/http"  // 🌟 新增
-	"os"        // 🌟 新增
-	"os/signal" // 🌟 新增
-	"syscall"   // 🌟 新增
+	"net/http"  
+	"os"        
+	"os/signal" 
+	"syscall"  
 	"time"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -38,7 +39,17 @@ func main() {
 
 	r := api.SetupRouter(llmRouter, redisCache)
 	port := config.GetEnv("API_PORT", ":8080")
-
+	
+	// 启动 9091 监控专属端口
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		log.Println("📊 监控服务已启动，监听端口 :9091")
+		if err := http.ListenAndServe(":9091", mux); err != nil {
+			log.Fatalf("❌ 监控服务启动失败: %v", err)
+		}
+	}()
+	
 	// 1. 创建原生的 HTTP Server
 	srv := &http.Server{
 		Addr:    port,
@@ -54,8 +65,8 @@ func main() {
 
 	// 3. 设置系统信号监听
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM) // 捕获 Ctrl+C 和 kill 信号
-	<-quit                                               // 阻塞在这里，直到收到系统信号
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 
 	log.Println("⚠️ 接收到关闭信号，准备优雅停机，不再接收新请求...")
 

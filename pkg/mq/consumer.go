@@ -84,7 +84,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 	for {
 		select {
 		case c.limitChan <- struct{}{}:
-		log.Println("🔓 拿到令牌，开始 Fetch...") // 加这一行
+		log.Println("🔓 拿到令牌，开始 Fetch...")
 		case <-ctx.Done():
 			log.Println("🛑 停止拉取新消息，等待处理中的任务...")
 			return
@@ -116,7 +116,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 	}
 }
 
-// 🌟 核心处理逻辑
+//核心处理逻辑
 func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	// 1. 读取当前是第几次重试
 	currentRetryCount := getRetryCountFromHeader(msg.Headers)
@@ -143,7 +143,6 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 
 	if !rpmAllowed || !tpmAllowed {
 		log.Printf("🚫 [限流] 租户 %s 触发流控(Redis/本地降级)，转入重试队列！", task.APIKey)
-		// 🌟 绝不 Sleep！立刻扔进重试队列，交出主线程控制权
 		c.sendToRetryAndCommit(msg, "触发租户级限流，等待系统额度恢复", 0)
 		return
 	}
@@ -245,7 +244,7 @@ func (c *KafkaConsumer) handleCallback(ctx context.Context, msg kafka.Message, t
 		if err == nil {
 			log.Printf("✅ 任务 [%s] 回调成功！消耗 Token: %d", task.TaskID, usage.TotalTokens)
 			metrics.TasksTotal.WithLabelValues("success").Inc()
-			c.commit(msg) // 🌟 最终大圆满，提交 Offset
+			c.commit(msg)
 			return
 		}
 

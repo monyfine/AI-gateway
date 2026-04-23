@@ -3,7 +3,7 @@ package config
 import (
 	"log"
 	"os"
-	"fmt"
+	// "fmt"
 
 	"github.com/joho/godotenv"
 )
@@ -19,7 +19,7 @@ func LoadConfig() {
 
 // GetEnv 获取配置，支持默认值
 func GetEnv(key, defaultValue string) string {
-	fmt.Println("fsdfsf")
+	// fmt.Println("fsdfsf")
 	value := os.Getenv(key)
 	if value == "" {
 		return defaultValue
