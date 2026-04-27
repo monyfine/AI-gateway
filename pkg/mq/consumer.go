@@ -137,15 +137,16 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	log.Printf("📥 [收到任务] ID: %s, 文本长度: %d 字符", task.TaskID, len(task.Content))
 	// ==========================================
 	// 阶段 2：限流与风控 (临时错误判定，包含 Redis 降级策略)
+	//这里前面已经查过了，没必要每次重试都查过了
 	// ==========================================
-	rpmAllowed, _ := c.redisCache.CheckRPMLimit(ctx, task.APIKey, task.RPMLimit)
-	tpmAllowed, _ := c.redisCache.CheckTPMLimit(ctx, task.APIKey, task.TPMLimit)
+	// rpmAllowed, _ := c.redisCache.CheckRPMLimit(ctx, task.APIKey, task.RPMLimit)
+	// tpmAllowed, _ := c.redisCache.CheckTPMLimit(ctx, task.APIKey, task.TPMLimit)
 
-	if !rpmAllowed || !tpmAllowed {
-		log.Printf("🚫 [限流] 租户 %s 触发流控(Redis/本地降级)，转入重试队列！", task.APIKey)
-		c.sendToRetryAndCommit(msg, "触发租户级限流，等待系统额度恢复", 0)
-		return
-	}
+	// if !rpmAllowed || !tpmAllowed {
+	// 	log.Printf("🚫 [限流] 租户 %s 触发流控(Redis/本地降级)，转入重试队列！", task.APIKey)
+	// 	c.sendToRetryAndCommit(msg, "触发租户级限流，等待系统额度恢复", 0)
+	// 	return
+	// }
 
 	// ==========================================
 	// 阶段 3：缓存拦截

@@ -13,11 +13,11 @@ import (
 	"net/http"
 	"strings"
 	"time"
-	"fmt"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
+	//这里如果用confluent-kafka-go如果在极高的吞吐量和大数据包的场景下会比segmentio/kafka-go快2-5倍（他是用c/c++实现的）如果是发送极其零碎的单条小消息，并且不开启批处理，这种 CGO 开销反而可能让它比纯 Go 库还要慢。如果底层 C 代码或者 Go 与 C 交互的地方出现内存泄漏，Go 原生的 pprof 性能分析工具根本查不到 C 堆内存的情况，很难排查 如果需要非常高的性能，并且愿意投入时间调试和维护，那么用confluent-kafka-go
 )
 
 type ChatRequest struct {
@@ -26,15 +26,20 @@ type ChatRequest struct {
 }
 
 func sendTaskToKafka(ctx context.Context, brokers []string, topic string, task mq.TaskMessage) error {
+	//Marshal是序列化，讲GO中的数据结构转换成JSON格式的字节流，Unmarshal是反序列化，把JSON格式的字节流转换成Go中的数据结构，内部是个反射机制
 	payload, err := json.Marshal(task)
 	if err != nil {
 		return err
 	}
-
+	//这里初始化一个Kafka的生产者，指定了Kafka集群的地址、目标Topic、负载均衡策略和消息确认机制
 	writer := &kafka.Writer{
+		//Addr字段指定了Kafka集群的地址，这里支持多个地址以逗号分隔，确保高可用性。
 		Addr:         kafka.TCP(brokers...),
+		//Topic字段指定了消息要发送到哪个Topic，这里我们会根据任务的Token数量动态决定。
 		Topic:        topic,
+		//Balancer字段指定了负载均衡策略，这里使用LeastBytes策略，确保消息被发送到当前负载最轻的分区。
 		Balancer:     &kafka.LeastBytes{},
+		//RequiredAcks字段指定了消息确认机制，这里设置为RequireAll，确保消息被所有副本确认后才算发送成功，提升数据可靠性。
 		RequiredAcks: kafka.RequireAll,
 	}
 	defer writer.Close()
@@ -49,6 +54,8 @@ func sendTaskToKafka(ctx context.Context, brokers []string, topic string, task m
 func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []string, fastTopic string, heavyTopic string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req ChatRequest
+		//ShouldBindJSON 本质就是一个反射和JSON解析器
+		//读取原始流 -> 反射遍历结构体 -> JSON 解析器转换 -> 验证器校验
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误: prompt 不能为空"})
 			return
@@ -61,12 +68,15 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 		// ==========================================
 		// 🌟 场景 A：前端请求流式输出 (Stream: true)
 		// ==========================================
-		fmt.Println(req.Stream)
 		if req.Stream {
+			//SSE 需要特殊的 Header 来告诉浏览器这是一个持续的流
+			//确定了通信的协议类型
 			c.Writer.Header().Set("Content-Type", "text/event-stream")
+			//保证了通信的实时性（不被缓存干扰）
 			c.Writer.Header().Set("Cache-Control", "no-cache")
+			//保证了通信的持久性（连接不被断开）但是到Nigux的时间限制还是会关闭
 			c.Writer.Header().Set("Connection", "keep-alive")
-
+			c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 			if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
 				c.SSEvent("message", cachedResult)
 				c.SSEvent("message", "[DONE]")
@@ -136,7 +146,7 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 		}
 
 		// ==========================================
-		// 🌟 场景 B：非流式输出 (改造为异步投递到 Kafka)
+		// 🌟 场景 B：非流式输出 (异步投递到 Kafka)
 		// ==========================================
 		// 1. 先查缓存，如果有直接返回
 		if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
@@ -173,7 +183,7 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 		// 3. 智能路由：根据 Token 数量决定进哪个队列
 		tokenCount := tokenizer.CountTokens(req.Prompt)
 		targetTopic := fastTopic
-		if tokenCount > 40 {
+		if tokenCount > 4000 {
 			targetTopic = heavyTopic
 		}
 

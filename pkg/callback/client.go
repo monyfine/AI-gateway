@@ -53,6 +53,5 @@ func (c *CallbackClient) SendResult(ctx context.Context, taskID string, aiResult
 	if resp.StatusCode() != 200 {
 		return fmt.Errorf("主系统返回错误状态码: %d, 响应: %s", resp.StatusCode(), resp.String())
 	}
-
 	return nil
 }

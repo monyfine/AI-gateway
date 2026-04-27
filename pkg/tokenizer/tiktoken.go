@@ -23,5 +23,6 @@ func CountTokens(text string) int {
 	}
 	// Encode 方法会按照 BPE 算法将文本切分成 Token 数组
 	tokens := tkm.Encode(text, nil, nil)
-	return len(tokens)
+	//这里乘2是为了把问题和答案的Token数都考虑进去，毕竟我们要预估整个对话的Token消耗
+	return len(tokens)*2
 }

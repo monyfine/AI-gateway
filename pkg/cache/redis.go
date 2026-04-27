@@ -261,11 +261,11 @@ func (c *RedisCache)GetCachedResponse(prompt string)(string,bool){
 	val, err := c.client.Get(ctx,key).Result()
 
 	if err == nil {
-		return val, true // 🌟 成功命中
+		return val, true //成功命中
 	}
 
 	if err == redis.Nil {
-		// 🌟 这是正常的“缓存未命中”，不要打印 Warning 日志
+		//这是正常的“缓存未命中”
 		return "", false 
 	}
 

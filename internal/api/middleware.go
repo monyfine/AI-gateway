@@ -118,6 +118,7 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 			return
 		}
 		// 把查到的应用信息存入 Context，后面的 Handler 可以用
+		//然后到Handler里取出来用c.Get("app_info")就可以了
 		c.Set("app_info", app)
 		c.Next()
 	}
