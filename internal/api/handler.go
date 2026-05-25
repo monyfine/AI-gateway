@@ -4,58 +4,25 @@ import (
 	"ai-gateway/internal/model"
 	"ai-gateway/pkg/cache"
 	"ai-gateway/pkg/llm"
-	"ai-gateway/pkg/mq"
 	"ai-gateway/pkg/tokenizer"
-	"context"
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-	"github.com/segmentio/kafka-go"
-	//这里如果用confluent-kafka-go如果在极高的吞吐量和大数据包的场景下会比segmentio/kafka-go快2-5倍（他是用c/c++实现的）如果是发送极其零碎的单条小消息，并且不开启批处理，这种 CGO 开销反而可能让它比纯 Go 库还要慢。如果底层 C 代码或者 Go 与 C 交互的地方出现内存泄漏，Go 原生的 pprof 性能分析工具根本查不到 C 堆内存的情况，很难排查 如果需要非常高的性能，并且愿意投入时间调试和维护，那么用confluent-kafka-go
 )
 
 type ChatRequest struct {
+	Model  string `json:"model" binding:"required"`
 	Prompt string `json:"prompt" binding:"required"`
 	Stream bool   `json:"stream"`
 }
 
-func sendTaskToKafka(ctx context.Context, brokers []string, topic string, task mq.TaskMessage) error {
-	//Marshal是序列化，讲GO中的数据结构转换成JSON格式的字节流，Unmarshal是反序列化，把JSON格式的字节流转换成Go中的数据结构，内部是个反射机制
-	payload, err := json.Marshal(task)
-	if err != nil {
-		return err
-	}
-	//这里初始化一个Kafka的生产者，指定了Kafka集群的地址、目标Topic、负载均衡策略和消息确认机制
-	writer := &kafka.Writer{
-		//Addr字段指定了Kafka集群的地址，这里支持多个地址以逗号分隔，确保高可用性。
-		Addr:         kafka.TCP(brokers...),
-		//Topic字段指定了消息要发送到哪个Topic，这里我们会根据任务的Token数量动态决定。
-		Topic:        topic,
-		//Balancer字段指定了负载均衡策略，这里使用LeastBytes策略，确保消息被发送到当前负载最轻的分区。
-		Balancer:     &kafka.LeastBytes{},
-		//RequiredAcks字段指定了消息确认机制，这里设置为RequireAll，确保消息被所有副本确认后才算发送成功，提升数据可靠性。
-		RequiredAcks: kafka.RequireAll,
-	}
-	defer writer.Close()
-
-	return writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(task.TaskID),
-		Value: payload,
-	})
-}
-
-// ChatHandler 处理同步的 AI 请求
-func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []string, fastTopic string, heavyTopic string) gin.HandlerFunc {
+// ChatHandler 处理同步的 AI 请求 (网关核心)
+func ChatHandler(routerManager *llm.RouterManager, redisCache *cache.RedisCache) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req ChatRequest
-		//ShouldBindJSON 本质就是一个反射和JSON解析器
-		//读取原始流 -> 反射遍历结构体 -> JSON 解析器转换 -> 验证器校验
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误: prompt 不能为空"})
 			return
@@ -63,27 +30,34 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 
 		appInfo, _ := c.Get("app_info")
 		app := appInfo.(model.AppKey)
-		taskID := uuid.New().String()
-
+		ok, err := model.CheckBalance(app.ID)
+		if err != nil {
+			log.Printf("❌ 余额校验发生内部错误: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "服务内部错误，请稍后再试"})
+			return
+		}
+		if !ok {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": "账户余额不足，请充值"})
+			return
+		}
+		
+		router := routerManager.Get()
 		// ==========================================
 		// 🌟 场景 A：前端请求流式输出 (Stream: true)
 		// ==========================================
 		if req.Stream {
-			//SSE 需要特殊的 Header 来告诉浏览器这是一个持续的流
-			//确定了通信的协议类型
 			c.Writer.Header().Set("Content-Type", "text/event-stream")
-			//保证了通信的实时性（不被缓存干扰）
 			c.Writer.Header().Set("Cache-Control", "no-cache")
-			//保证了通信的持久性（连接不被断开）但是到Nigux的时间限制还是会关闭
 			c.Writer.Header().Set("Connection", "keep-alive")
 			c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+
 			if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
 				c.SSEvent("message", cachedResult)
 				c.SSEvent("message", "[DONE]")
 				return
 			}
 
-			ch, err := router.InvokeStreamWithFallback(c.Request.Context(), req.Prompt)
+			ch, err := router.InvokeStreamWithFallback(c.Request.Context(), req.Model, req.Prompt)
 			if err != nil {
 				c.SSEvent("error", err.Error())
 				return
@@ -91,6 +65,10 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 
 			var fullResponse strings.Builder
 			var finalUsage llm.Usage
+
+			promptTokens := tokenizer.CountTokens(req.Prompt)
+			currentTotalTokens := promptTokens
+			isInterrupted := false // 标记是否被网关强制阻断
 
 			c.Stream(func(w io.Writer) bool {
 				msg, ok := <-ch
@@ -101,6 +79,18 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 				if msg.Content != "" {
 					fullResponse.WriteString(msg.Content)
 					c.SSEvent("message", msg.Content)
+
+					chunkTokens := len(msg.Content)*6/10
+					currentTotalTokens += chunkTokens
+					if currentTotalTokens >= app.TPMLimit{
+						log.Printf("🚫 触发实时拦截：AppKey[%d] 流式输出超限 (当前估算: %d, 限制: %d)", app.ID, currentTotalTokens, app.TPMLimit)
+
+						c.SSEvent("error", "当前请求已达到 TPM 限制，输出被强制中断")
+						c.SSEvent("message", "[DONE]")
+						
+						isInterrupted = true
+						return  false
+					}
 				}
 				if msg.Usage != nil {
 					finalUsage = *msg.Usage
@@ -109,25 +99,31 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 			})
 
 			finalText := fullResponse.String()
+			// 异步记录日志与扣费
 			go func() {
 				var total, promptTokens, compTokens int
 				var status string
 
-				if finalUsage.TotalTokens > 0 {
-					promptTokens = finalUsage.PromptTokens
+				if !isInterrupted && finalUsage.TotalTokens > 0 {
+					promptTokens = finalUsage.PromptTokens // 覆盖为底层精确值
 					compTokens = finalUsage.CompletionTokens
 					total = finalUsage.TotalTokens
 					status = "success_stream"
 				} else {
-					promptTokens = tokenizer.CountTokens(req.Prompt)
+					// 走到这里说明：被强制掐断了，或者底层大模型没返回 Usage
+					// 利用 tokenizer 重新精确计算实际生成的字符 (finalText)
 					compTokens = tokenizer.CountTokens(finalText)
 					total = promptTokens + compTokens
-					status = "interrupted_stream"
+					
+					if isInterrupted {
+						status = "interrupted_stream" // 记录为被阻断状态
+					} else {
+						status = "success_stream_no_usage"
+					}
 				}
 
 				logEntry := model.RequestLog{
 					AppKeyID:         app.ID,
-					TaskID:           taskID,
 					Prompt:           req.Prompt,
 					Response:         finalText,
 					PromptTokens:     promptTokens,
@@ -136,33 +132,32 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 					Status:           status,
 				}
 				model.DB.Create(&logEntry)
-				redisCache.AddTPMUsage(app.Key, total)
+				redisCache.AddSlidingTPMUsage(app.Key, total)
 
 				if status == "success_stream" {
 					_ = redisCache.SetCachedResponse(req.Prompt, finalText)
+				}
+				deductErr := model.DeductBalance(app.ID, req.Model, promptTokens, compTokens)
+				if deductErr != nil {
+					log.Printf("🚨 流式调用异步扣费失败: appKeyID=%d, model=%s, err=%v", app.ID, req.Model, deductErr)
 				}
 			}()
 			return
 		}
 
 		// ==========================================
-		// 🌟 场景 B：非流式输出 (异步投递到 Kafka)
+		// 🌟 场景 B：非流式输出 (同步等待结果，不再发 Kafka)
 		// ==========================================
-		// 1. 先查缓存，如果有直接返回
+		// 1. 先查缓存
 		if cachedResult, ok := redisCache.GetCachedResponse(req.Prompt); ok {
 			log.Printf("💰 [同步接口] 缓存命中，0 延迟返回！")
-
-			logEntry := model.RequestLog{
+			model.DB.Create(&model.RequestLog{
 				AppKeyID: app.ID,
-				TaskID:   taskID,
 				Prompt:   req.Prompt,
 				Response: cachedResult,
 				Status:   "success_cached",
-			}
-			model.DB.Create(&logEntry)
-
+			})
 			c.JSON(http.StatusOK, gin.H{
-				"task_id": logEntry.TaskID,
 				"content": cachedResult,
 				"usage":   llm.Usage{},
 				"cached":  true,
@@ -170,69 +165,46 @@ func ChatHandler(router *llm.LLMRouter, redisCache *cache.RedisCache, brokers []
 			return
 		}
 
-		// 2. 构造要发往 Kafka 的任务消息
-		taskMsg := mq.TaskMessage{
-			TaskID:   taskID,
-			AppKeyID: app.ID,
-			APIKey:   app.Key,
-			RPMLimit: app.RPMLimit,
-			TPMLimit: app.TPMLimit,
-			Content:  req.Prompt,
-		}
-
-		// 3. 智能路由：根据 Token 数量决定进哪个队列
-		tokenCount := tokenizer.CountTokens(req.Prompt)
-		targetTopic := fastTopic
-		if tokenCount > 4000 {
-			targetTopic = heavyTopic
-		}
-
-		// 4. 投递到 Kafka
-		err := sendTaskToKafka(c.Request.Context(), brokers, targetTopic, taskMsg)
+		// 2. 同步调用大模型
+		aiResult, usage, err := router.InvokeWithFallback(c.Request.Context(), req.Model, req.Prompt)
 		if err != nil {
-			log.Printf("❌ 任务投递 Kafka 失败: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "系统繁忙，任务提交失败"})
+			log.Printf("❌ AI 调用失败: %v", err)
+			model.DB.Create(&model.RequestLog{
+				AppKeyID: app.ID,
+				Prompt:   req.Prompt,
+				Status:   "fail",
+				ErrorMsg: err.Error(),
+			})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "AI 服务暂时不可用", "details": err.Error()})
 			return
 		}
 
-		// 5. 记录一条初始状态的日志，方便后续追踪
-		logEntry := model.RequestLog{
-			AppKeyID: app.ID,
-			TaskID:   taskID,
-			Prompt:   req.Prompt,
-			Status:   "pending", // 标记为排队处理中
-		}
-		model.DB.Create(&logEntry)
+		// 3. 异步记录成功日志并扣费
+		go func() {
+			model.DB.Create(&model.RequestLog{
+				AppKeyID:         app.ID,
+				Prompt:           req.Prompt,
+				Response:         aiResult,
+				PromptTokens:     usage.PromptTokens,
+				CompletionTokens: usage.CompletionTokens,
+				TotalTokens:      usage.TotalTokens,
+				Status:           "success",
+			})
+			redisCache.AddSlidingTPMUsage(app.Key, usage.TotalTokens)
+			_ = redisCache.SetCachedResponse(req.Prompt, aiResult)
 
-		log.Printf("📤 任务 [%s] 已成功投递至 Kafka 队列 [%s], Token预估: %d", taskID, targetTopic, tokenCount)
+			deductErr := model.DeductBalance(app.ID, req.Model, usage.PromptTokens, usage.CompletionTokens)
+			if deductErr != nil {
+				log.Printf("🚨 同步调用异步扣费失败: appKeyID=%d, model=%s, err=%v", app.ID, req.Model, deductErr)
+			}
+		}()
 
-		// 6. 立即向前端返回 202 Accepted，告知任务已受理
-		c.JSON(http.StatusAccepted, gin.H{
-			"task_id": taskID,
-			"status":  "processing",
-			"message": "任务已提交至后台队列处理，请等待回调通知",
+		// 4. 立刻返回结果给前端
+		c.JSON(http.StatusOK, gin.H{
+			"content": aiResult,
+			"usage":   usage,
+			"cached":  false,
 		})
-	}
-}
-
-// CallbackHandler 模拟主系统接收 AI 处理结果的回调
-func CallbackHandler() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req struct {
-			TaskID  string `json:"task_id"`
-			Content string `json:"content"`
-			Status  string `json:"status"`
-		}
-
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "回调数据格式错误"})
-			return
-		}
-
-		log.Printf("🔔 [主系统] 收到 AI 任务回调: TaskID=%s, 状态=%s", req.TaskID, req.Status)
-		// 这里可以写你自己的业务逻辑，比如更新数据库里的文章状态等
-
-		c.JSON(http.StatusOK, gin.H{"message": "ok"})
 	}
 }
 
@@ -248,69 +220,6 @@ func StatsHandler(redisCache *cache.RedisCache) gin.HandlerFunc {
 			"code": 200,
 			"msg":  "success",
 			"data": stats,
-		})
-	}
-}
-
-// RetryDLQHandler 触发死信队列重试 (基于 Header 架构升级版)
-func RetryDLQHandler(dlqTopic string, targetTopic string, brokers []string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		reader := kafka.NewReader(kafka.ReaderConfig{
-			Brokers: brokers,
-			Topic:   dlqTopic,
-			GroupID: "dlq_admin_recovery_group",
-		})
-		defer reader.Close()
-
-		writer := &kafka.Writer{
-			Addr: kafka.TCP(brokers...),
-			// 注意：这里去掉了固定的 Topic，因为我们要用代码动态指定，做到“从哪来回哪去”
-			RequiredAcks: kafka.RequireAll,
-		}
-		defer writer.Close()
-
-		recoveredCount := 0
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		for {
-			msg, err := reader.ReadMessage(ctx)
-			if err != nil {
-				break // 读完或者 10 秒没新消息就退出
-			}
-
-			actualTarget := targetTopic
-			for _, h := range msg.Headers {
-				if h.Key == "x-original-topic" && len(h.Value) > 0 {
-					actualTarget = string(h.Value)
-					break
-				}
-			}
-
-			// 给它全新的 Header，重置重试次数为 0，并打上人工干预的标记
-			newHeaders := []kafka.Header{
-				{Key: "x-retry-count", Value: []byte("0")},     // 清除重试历史
-				{Key: "x-is-recovered", Value: []byte("true")}, // 标记为人工恢复
-			}
-
-			// 🌟 3. 直接投递：不再需要 json.Unmarshal 拆包！
-			err = writer.WriteMessages(context.Background(), kafka.Message{
-				Topic:   actualTarget, // 精准打回原队列 (如 ai_task_fast)
-				Key:     msg.Key,
-				Value:   msg.Value, // 直接原封不动把纯净的业务 JSON 发回去
-				Headers: newHeaders,
-			})
-
-			if err == nil {
-				recoveredCount++
-			} else {
-				log.Printf("❌ 人工恢复消息失败 [Offset: %d]: %v", msg.Offset, err)
-			}
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"message":         "死信队列补偿执行完毕",
-			"recovered_count": recoveredCount,
 		})
 	}
 }

@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Gateway 控制台</title>
+    <!-- 引入 Tailwind CSS (用于快速画出好看的界面) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans">
+    <div id="app" v-cloak>
+        
+        <!-- ================= 登录页面 ================= -->
+        <div v-if="!isLoggedIn" class="min-h-screen flex items-center justify-center">
+            <div class="bg-white p-8 rounded-lg shadow-lg w-96">
+                <h1 class="text-2xl font-bold mb-6 text-center text-blue-600">AI Gateway 控制台</h1>
+                <form @submit.prevent="login">
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700">用户名</label>
+                        <input v-model="loginForm.username" type="text" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500" required>
+                    </div>
+                    <div class="mb-6">
+                        <label class="block text-sm font-medium text-gray-700">密码</label>
+                        <input v-model="loginForm.password" type="password" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500" required>
+                    </div>
+                    <button type="submit" class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded hover:bg-blue-700 transition">
+                        登录
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- ================= 主控制台页面 ================= -->
+        <div v-else class="flex h-screen overflow-hidden">
+            <!-- 侧边栏 -->
+            <aside class="w-64 bg-gray-800 text-white flex flex-col">
+                <div class="p-4 text-xl font-bold border-b border-gray-700 text-center">
+                    🚀 AI Gateway
+                </div>
+                <nav class="flex-1 p-4 space-y-2">
+                    <button @click="currentTab = 'dashboard'" :class="{'bg-gray-700': currentTab === 'dashboard'}" class="w-full text-left p-2 rounded hover:bg-gray-700 transition">📊 数据大盘</button>
+                    <button @click="currentTab = 'keys'" :class="{'bg-gray-700': currentTab === 'keys'}" class="w-full text-left p-2 rounded hover:bg-gray-700 transition">🔑 租户密钥管理</button>
+                    <button @click="currentTab = 'system'" :class="{'bg-gray-700': currentTab === 'system'}" class="w-full text-left p-2 rounded hover:bg-gray-700 transition">⚙️ 系统设置</button>
+                </nav>
+                <div class="p-4 border-t border-gray-700">
+                    <button @click="logout" class="w-full bg-red-600 text-white py-2 rounded hover:bg-red-700 transition">退出登录</button>
+                </div>
+            </aside>
+
+            <!-- 右侧内容区 -->
+            <main class="flex-1 p-8 overflow-y-auto">
+                
+                <!-- 1. 数据大盘 Tab -->
+                <div v-if="currentTab === 'dashboard'">
+                    <h2 class="text-2xl font-bold mb-6">今日运行数据</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                        <div class="bg-white p-6 rounded-lg shadow border-l-4 border-blue-500">
+                            <div class="text-gray-500 text-sm">总请求数</div>
+                            <div class="text-3xl font-bold mt-2">{{ stats.total_requests }}</div>
+                        </div>
+                        <div class="bg-white p-6 rounded-lg shadow border-l-4 border-green-500">
+                            <div class="text-gray-500 text-sm">成功请求数</div>
+                            <div class="text-3xl font-bold mt-2 text-green-600">{{ stats.success_requests }}</div>
+                        </div>
+                        <div class="bg-white p-6 rounded-lg shadow border-l-4 border-purple-500">
+                            <div class="text-gray-500 text-sm">消耗总 Token</div>
+                            <div class="text-3xl font-bold mt-2 text-purple-600">{{ stats.total_tokens }}</div>
+                        </div>
+                        <div class="bg-white p-6 rounded-lg shadow border-l-4 border-yellow-500">
+                            <div class="text-gray-500 text-sm">活跃租户数</div>
+                            <div class="text-3xl font-bold mt-2 text-yellow-600">{{ stats.active_app_keys }}</div>
+                        </div>
+                    </div>
+                    <button @click="fetchDashboard" class="mt-6 bg-gray-200 text-gray-700 px-4 py-2 rounded hover:bg-gray-300">刷新数据</button>
+                </div>
+
+                <!-- 2. 租户密钥管理 Tab -->
+                <div v-if="currentTab === 'keys'">
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold">租户密钥 (AppKey)</h2>
+                        <button @click="showCreateModal = true" class="bg-blue-600 text-white px-4 py-2 rounded shadow hover:bg-blue-700">+ 新建 Key</button>
+                    </div>
+                    
+                    <div class="bg-white rounded-lg shadow overflow-hidden">
+                        <table class="min-w-full">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">应用名称</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">API Key</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">RPM 限制</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">TPM 限制</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">余额</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-200">
+                                <tr v-for="key in appKeys" :key="key.ID">
+                                    <td class="px-6 py-4 font-medium">{{ key.AppName }}</td>
+                                    <td class="px-6 py-4 text-sm text-gray-500 font-mono">{{ key.Key }}</td>
+                                    <td class="px-6 py-4 text-sm">{{ key.RPMLimit }}</td>
+                                    <td class="px-6 py-4 text-sm">{{ key.TPMLimit }}</td>
+                                    <td class="px-6 py-4 text-sm text-red-500 font-bold">{{ key.Balance / 10000 }} 元</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 3. 系统设置 Tab -->
+                <div v-if="currentTab === 'system'">
+                    <h2 class="text-2xl font-bold mb-6">系统高级设置</h2>
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <h3 class="text-lg font-bold text-gray-800 mb-2">渠道配置热加载</h3>
+                        <p class="text-gray-600 mb-4">当您在数据库中修改了 Channel 表（新增、删除渠道或修改权重）后，点击此按钮可无损热更新网关路由，无需重启服务。</p>
+                        <button @click="reloadChannels" class="bg-red-600 text-white px-4 py-2 rounded shadow hover:bg-red-700 transition">
+                            🔥 立即热加载渠道
+                        </button>
+                    </div>
+                </div>
+
+            </main>
+        </div>
+
+        <!-- 新建 Key 的弹窗 -->
+        <div v-if="showCreateModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+            <div class="bg-white p-6 rounded-lg shadow-lg w-96">
+                <h3 class="text-xl font-bold mb-4">新建 AppKey</h3>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">应用名称</label>
+                        <input v-model="newKeyForm.app_name" type="text" class="mt-1 block w-full border border-gray-300 rounded p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">RPM 限制 (次/分钟)</label>
+                        <input v-model.number="newKeyForm.rpm_limit" type="number" class="mt-1 block w-full border border-gray-300 rounded p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">TPM 限制 (Token/分钟)</label>
+                        <input v-model.number="newKeyForm.tpm_limit" type="number" class="mt-1 block w-full border border-gray-300 rounded p-2">
+                    </div>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button @click="showCreateModal = false" class="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300">取消</button>
+                    <button @click="createKey" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">确认创建</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Vue 3 逻辑代码 -->
+    <script>
+        const { createApp, ref, onMounted, watch } = Vue;
+
+        createApp({
+            setup() {
+                // 状态变量
+                const token = ref(localStorage.getItem('admin_token') || '');
+                const isLoggedIn = ref(!!token.value);
+                const currentTab = ref('dashboard');
+                
+                const loginForm = ref({ username: '', password: '' });
+                const stats = ref({ total_requests: 0, success_requests: 0, total_tokens: 0, active_app_keys: 0 });
+                const appKeys = ref([]);
+                
+                const showCreateModal = ref(false);
+                const newKeyForm = ref({ app_name: '', rpm_limit: 60, tpm_limit: 100000 });
+
+                // 封装带 Token 的请求函数
+                const apiFetch = async (url, options = {}) => {
+                    const headers = {
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    };
+                    if (token.value) {
+                        headers['Authorization'] = `Bearer ${token.value}`;
+                    }
+                    const response = await fetch(url, { ...options, headers });
+                    if (response.status === 401) {
+                        alert('登录已过期，请重新登录');
+                        logout();
+                        throw new Error('Unauthorized');
+                    }
+                    return response.json();
+                };
+
+                // 登录
+                const login = async () => {
+                    try {
+                        const res = await apiFetch('/api/v1/admin/login', {
+                            method: 'POST',
+                            body: JSON.stringify(loginForm.value)
+                        });
+                        if (res.token) {
+                            token.value = res.token;
+                            localStorage.setItem('admin_token', res.token);
+                            isLoggedIn.value = true;
+                            fetchDashboard();
+                        } else {
+                            alert(res.error || '登录失败');
+                        }
+                    } catch (e) {
+                        alert('网络错误或账号密码错误');
+                    }
+                };
+
+                // 退出登录
+                const logout = () => {
+                    token.value = '';
+                    localStorage.removeItem('admin_token');
+                    isLoggedIn.value = false;
+                };
+
+                // 获取大盘数据
+                const fetchDashboard = async () => {
+                    const res = await apiFetch('/api/v1/admin/dashboard');
+                    if (res.data) stats.value = res.data;
+                };
+
+                // 获取 Key 列表
+                const fetchKeys = async () => {
+                    const res = await apiFetch('/api/v1/admin/keys?size=100');
+                    if (res.list) appKeys.value = res.list;
+                };
+
+                // 创建新 Key
+                const createKey = async () => {
+                    const res = await apiFetch('/api/v1/admin/keys', {
+                        method: 'POST',
+                        body: JSON.stringify(newKeyForm.value)
+                    });
+                    if (res.ID) {
+                        alert('创建成功！请在列表中查看。');
+                        showCreateModal.value = false;
+                        fetchKeys();
+                    } else {
+                        alert(res.error || '创建失败');
+                    }
+                };
+
+                // 热加载渠道
+                const reloadChannels = async () => {
+                    if(!confirm("确定要热加载渠道配置吗？这不会中断正在进行的请求。")) return;
+                    const res = await apiFetch('/api/v1/admin/channels/reload', { method: 'POST' });
+                    alert(res.message || '热加载完成');
+                };
+
+                // 监听 Tab 切换，自动加载数据
+                watch(currentTab, (newTab) => {
+                    if (newTab === 'dashboard') fetchDashboard();
+                    if (newTab === 'keys') fetchKeys();
+                });
+
+                // 初始化
+                onMounted(() => {
+                    if (isLoggedIn.value) {
+                        fetchDashboard();
+                    }
+                });
+
+                return {
+                    isLoggedIn, currentTab, loginForm, stats, appKeys,
+                    showCreateModal, newKeyForm,
+                    login, logout, fetchDashboard, fetchKeys, createKey, reloadChannels
+                };
+            }
+        }).mount('#app');
+    </script>
+    <style>
+        [v-cloak] { display: none; }
+    </style>
+</body>
+</html>

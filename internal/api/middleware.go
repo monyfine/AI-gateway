@@ -2,19 +2,21 @@ package api
 
 import (
 	"ai-gateway/internal/model"
-	"ai-gateway/pkg/metrics" 
 	"ai-gateway/pkg/cache"
+	"ai-gateway/pkg/metrics"
+	"ai-gateway/pkg/utils"
 	"log"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"math/rand"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sync/singleflight"
 )
+
 type cachedApp struct {
 	App       model.AppKey
 	ExpiresAt time.Time
@@ -23,7 +25,7 @@ type cachedApp struct {
 var (
 	authCache sync.Map
 	//用map容易导致读写冲突
-	sfGroup   singleflight.Group //用于防缓存击穿
+	sfGroup singleflight.Group //用于防缓存击穿
 )
 
 // 提取一个生成随机过期时间的辅助函数
@@ -54,7 +56,7 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 			if time.Now().Before(cached.ExpiresAt) {
 				app = cached.App
 				needQueryDB = false
-				
+
 				// 总有效期是 5 分钟。只有当剩余有效期不足 2 分钟时，才给它续命。
 				// 这样 1000 个并发请求过来，只要它还处于充足的有效期内，就不会触发任何 Store 写入！
 				if time.Until(cached.ExpiresAt) < 2*time.Minute {
@@ -91,14 +93,14 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 			}
 			app = v.(model.AppKey)
 		}
-		
+
 		// 1. 校验 RPM (请求频率)
 		rpmAllowed, err := redisCache.CheckRPMLimit(c.Request.Context(), app.Key, app.RPMLimit)
 		if err != nil {
 			log.Printf("RPM 限流系统异常: %v", err)
 		}
 		if !rpmAllowed {
-			metrics.RateLimitTotal.WithLabelValues(app.AppName,"rpm").Inc()
+			metrics.RateLimitTotal.WithLabelValues(app.AppName, "rpm").Inc()
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": "请求过于频繁，已触发租户级 RPM 限流",
 			})
@@ -106,7 +108,7 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 		}
 
 		// 2. 校验 TPM (Token 消耗频率)
-		tpmAllowed, err := redisCache.CheckTPMLimit(c.Request.Context(), app.Key, app.TPMLimit)
+		tpmAllowed, err := redisCache.CheckSlidingTPM(c.Request.Context(), app.Key, app.TPMLimit)
 		if err != nil {
 			log.Printf("TPM 限流系统异常: %v", err)
 		}
@@ -125,9 +127,9 @@ func AuthMiddleware(redisCache *cache.RedisCache) gin.HandlerFunc {
 }
 
 // 新增一个全局监控中间件，用来记录所有 API 的请求量和状态码
-func PrometheusMiddleware() gin.HandlerFunc{
+func PrometheusMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Next()// 先执行后面的业务逻辑
+		c.Next() // 先执行后面的业务逻辑
 
 		// 业务执行完后，获取状态码并记录
 		status := strconv.Itoa(c.Writer.Status())
@@ -136,5 +138,59 @@ func PrometheusMiddleware() gin.HandlerFunc{
 			path = "unknown"
 		}
 		metrics.APIRequestsTotal.WithLabelValues(c.Request.Method, path, status).Inc()
+	}
+}
+
+// AdminAuthMiddleware 管理后台专属的 JWT 鉴权中间件
+func AdminAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未登录或缺少 Token"})
+			return
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		claims, err := utils.ParseToken(tokenString)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Token 无效或已过期，请重新登录"})
+			return
+		}
+
+		// 🌟 新增：严格校验角色，防止普通用户越权访问后台
+		if claims.Role != "admin" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "无权访问后台接口"})
+			return
+		}
+
+		// 管理员中间件存的是 username
+		c.Set("admin_username", claims.Username)
+		c.Next()
+	}
+}
+
+// UserAuthMiddleware 普通租户的 JWT 鉴权中间件
+func UserAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 1. 获取 Header 中的 Token 并解析
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未登录或缺少 Token"})
+			return
+		}
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		// 2. 校验角色：如果 claims.Role != "user"，返回 403 Forbidden ("无权访问")
+		claims, err := utils.ParseToken(tokenString)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Token 无效或已过期，请重新登录"})
+			return
+		}
+		if claims.Role != "user" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "无权访问"})
+			return
+		}
+		// 3. 将解析出的 user_id 存入 Context，方便后续 Handler 做数据隔离
+		c.Set("user_id", claims.UserID)
+		c.Next()
 	}
 }

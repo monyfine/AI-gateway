@@ -22,43 +22,53 @@ type Usage struct {
 // Provider 定义模型供应商接口
 type Provider interface {
 	Name() string
-	Invoke(ctx context.Context, prompt string) (string, Usage, error) //增加 Usage 返回
-	InvokeStream(ctx context.Context, prompt string) (<-chan StreamMessage, error)
+	Models()[]string 
+	Invoke(ctx context.Context, model string, prompt string) (string, Usage, error)
+	InvokeStream(ctx context.Context, model string, prompt string) (<-chan StreamMessage, error)
 }
 
-// BaseClient 基础客户端（OpenAI 协议兼容）
 type BaseClient struct {
 	name       string
 	client     *resty.Client
-	httpClient *http.Client //新增：用于流式请求的原生 HTTP 客户端
+	httpClient *http.Client
 	apiKey     string
 	apiURL     string
-	model      string
+	models[]string // 🆕 改为切片存储
 }
 
 type StreamMessage struct {
 	Content string
-	Usage   *Usage // 只有流式输出的最后一块，这个字段才会有值
+	Usage   *Usage
 }
 
-func NewBaseClient(name, url, key, model string) *BaseClient {
+func NewBaseClient(name, url, key, modelsStr string) *BaseClient {
 	restyCli := resty.New()
 	restyCli.SetTimeout(300 * time.Second)
+	
+	// 将数据库里逗号分隔的字符串解析为切片
+	var models[]string
+	for _, m := range strings.Split(modelsStr, ",") {
+		if trimmed := strings.TrimSpace(m); trimmed != "" {
+			models = append(models, trimmed)
+		}
+	}
+
 	return &BaseClient{
 		name:   name,
 		client: restyCli,
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second, // 流式请求超时时间设长一点
+			Timeout: 60 * time.Second,
 		},
 		apiURL: url,
 		apiKey: key,
-		model:  model,
+		models: models,
 	}
 }
 
 func (c *BaseClient) Name() string { return c.name }
+func (c *BaseClient) Models()[]string { return c.models } // 🆕 实现接口方法
 
-func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, error) {
+func (c *BaseClient) Invoke(ctx context.Context, model string, prompt string) (string, Usage, error){
 	var result Response
 
 	resp, err := c.client.R().
@@ -66,7 +76,7 @@ func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, 
 		SetAuthToken(c.apiKey).
 		SetHeader("Content-Type", "application/json").
 		SetBody(Request{
-			Model: c.model,
+			Model: model,
 			Messages: []Message{
 				{Role: "user", Content: prompt},
 			},
@@ -92,9 +102,9 @@ func (c *BaseClient) Invoke(ctx context.Context, prompt string) (string, Usage, 
 }
 
 //流式调用实现
-func (c *BaseClient) InvokeStream(ctx context.Context, prompt string) (<-chan StreamMessage, error) {
+func (c *BaseClient) InvokeStream(ctx context.Context, model string, prompt string) (<-chan StreamMessage, error) {
 	reqBody := map[string]interface{}{
-		"model": c.model,
+		"model": model, 
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},

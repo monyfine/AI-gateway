@@ -6,52 +6,55 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/sony/gobreaker"
 )
 
 type LLMRouter struct {
-	providers []Provider
-	breakers  map[string]*gobreaker.CircuitBreaker
+	modelProviders map[string][]Provider
+	breakers       map[string]*gobreaker.CircuitBreaker
 }
 
 func NewLLMRouter(providers ...Provider) *LLMRouter {
+	modelProviders := make(map[string][]Provider)
 	breakers := make(map[string]*gobreaker.CircuitBreaker)
-
-	for _, p := range providers {
-		// 为每个供应商配置熔断器
-		st := gobreaker.Settings{
+	for _,p := range providers{
+		for _,modelName := range p.Models(){
+			modelProviders[modelName] = append(modelProviders[modelName], p)
+		}
+		cbSettings := gobreaker.Settings{
 			Name:        p.Name(),
-			MaxRequests: 5,              // 半开状态允许通过的请求数
-			Interval:    60 * time.Second, // 定期清空计数器
-			Timeout:     30 * time.Second, // 熔断器断开后，多久进入半开状态尝试恢复
+			MaxRequests: 3,
+			Interval:    5 * time.Second,
+			Timeout:     10 * time.Second,
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
-				// 至少得有 50 个请求进来，并且失败率超过 50%，才触发熔断！
-				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-				return counts.Requests >= 5 && failureRatio >= 0.6
-			},
-			OnStateChange: func(name string, from, to gobreaker.State) {
-				log.Printf("🚨 熔断器[%s] 状态变更: %v -> %v", name, from, to)
+				return counts.ConsecutiveFailures >= 3
 			},
 		}
-		breakers[p.Name()] = gobreaker.NewCircuitBreaker(st)
+		breakers[p.Name()] = gobreaker.NewCircuitBreaker(cbSettings)
 	}
-
 	return &LLMRouter{
-		providers: providers,
-		breakers:  breakers,
+		modelProviders: modelProviders,
+		breakers:       breakers,
 	}
 }
 
+// InvokeWithFallback 带有模型路由、3次重试、熔断与监控的同步调用
+func (r *LLMRouter) InvokeWithFallback(ctx context.Context, model string, prompt string) (string, Usage, error) {
+	// 1. 按模型匹配对应的渠道列表
+	providers, ok := r.modelProviders[model]
+	if !ok || len(providers) == 0 {
+		return "", Usage{}, fmt.Errorf("不支持的模型: %s", model)
+	}
 
-func (r *LLMRouter) InvokeWithFallback(ctx context.Context, prompt string) (string, Usage, error) {
 	var lastErr error
 
-	for _, p := range r.providers {
+	for _, p := range providers {
 		cb := r.breakers[p.Name()]
 
-		//1. 定义一个“书包”结构体，用来装我们要带出来的两个宝贝
+		// 定义一个“书包”结构体，用来装我们要带出来的两个宝贝
 		type resultWrapper struct {
 			content string
 			usage   Usage
@@ -62,26 +65,27 @@ func (r *LLMRouter) InvokeWithFallback(ctx context.Context, prompt string) (stri
 		for attempt := 1; attempt <= 3; attempt++ {
 			start := time.Now()
 
-			// 🌟 2. 这里的匿名函数必须只返回 (interface{}, error)
+			// 🌟 这里的匿名函数必须只返回 (interface{}, error)
 			rawRes, err := cb.Execute(func() (interface{}, error) {
-				content, usage, err := p.Invoke(ctx, prompt) // 这里返回 3 个值
-				if err != nil {
-					if errors.Is(err, context.Canceled){
-						return resultWrapper{err: err}, nil
+				// 🌟 核心修改：底层调用时带上 model 参数
+				content, usage, invokeErr := p.Invoke(ctx, model, prompt) 
+				if invokeErr != nil {
+					if errors.Is(invokeErr, context.Canceled) {
+						return resultWrapper{err: invokeErr}, nil
 					}
-					return nil, err // 失败时返回 nil 和 error
+					return nil, invokeErr // 失败时返回 nil 和 error
 				}
 				// 🌟 关键：把 content 和 usage 塞进书包，作为一个整体 (interface{}) 返回
 				return resultWrapper{content: content, usage: usage}, nil
 			})
 
-			// 记录监控指标
+			// 记录监控指标 (建议给 metric 加一个 model 标签，方便后续统计模型维度的耗时)
 			metrics.LLMLatency.WithLabelValues(p.Name()).Observe(time.Since(start).Seconds())
 
 			if err == nil {
-				// 🌟 3. 成功了！把书包打开，取出里面的东西
+				// 🌟 成功了！把书包打开，取出里面的东西
 				data := rawRes.(resultWrapper)
-				// 如果“书包”里装的是用户取消错误，直接返回，不再尝试其他供应商
+				// 如果“书包”里装的是用户取消错误，直接返回，不再尝试当前渠道和其他渠道
 				if data.err != nil {
 					return "", Usage{}, data.err
 				}
@@ -92,52 +96,89 @@ func (r *LLMRouter) InvokeWithFallback(ctx context.Context, prompt string) (stri
 			// --- 失败处理逻辑 ---
 			lastErr = err
 
-			// 如果熔断器开了，直接换供应商，别试了
+			// 如果熔断器开了，直接换下一个供应商，别试了
 			if errors.Is(err, gobreaker.ErrOpenState) {
-				log.Printf("🚨 [%s] 熔断器已开启，跳过重试", p.Name())
+				log.Printf("🚨 [%s] 调用模型 [%s] 熔断器已开启，跳过重试", p.Name(), model)
 				break
 			}
 
-			log.Printf("⚠️ [%s] 第 %d 次尝试失败: %v", p.Name(), attempt, err)
+			log.Printf("⚠️ [%s] 调用模型 [%s] 第 %d 次尝试失败: %v", p.Name(), model, attempt, err)
 			if attempt < 3 {
 				time.Sleep(time.Second * time.Duration(attempt))
 			}
 		}
 	}
 
-	return "", Usage{}, fmt.Errorf("全线崩溃，最后错误: %w", lastErr)
+	return "", Usage{}, fmt.Errorf("模型 %s 的所有渠道全线崩溃，最后错误: %w", model, lastErr)
 }
 
-// 流式路由
-func (r *LLMRouter) InvokeStreamWithFallback(ctx context.Context, prompt string) (<-chan StreamMessage, error) {
+// InvokeStreamWithFallback 带有模型路由、熔断机制的流式调用
+func (r *LLMRouter) InvokeStreamWithFallback(ctx context.Context, model string, prompt string) (<-chan StreamMessage, error) {
+	// 1. 按模型匹配对应的渠道列表
+	providers, ok := r.modelProviders[model]
+	if !ok || len(providers) == 0 {
+		return nil, fmt.Errorf("不支持的模型: %s", model)
+	}
+
 	var lastErr error
 
-	for _, p := range r.providers {
+	for _, p := range providers {
 		cb := r.breakers[p.Name()]
 
 		rawRes, err := cb.Execute(func() (interface{}, error) {
-			ch, err := p.InvokeStream(ctx, prompt)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil, err // 用户取消不计入熔断
+			// 🌟 核心修改：流式调用也加上 model 参数
+			ch, streamErr := p.InvokeStream(ctx, model, prompt)
+			if streamErr != nil {
+				if errors.Is(streamErr, context.Canceled) {
+					// 用户取消，视为执行成功（不触发熔断），但返回错误给上层
+					return nil, streamErr 
 				}
-				// 🚨 致命 Bug 修复：这里原来漏了 return nil, err
-				// 如果不 return，会导致向外返回 nil channel，引发永久死锁！
-				return nil, err
+				// 🚨 致命 Bug 修复保留：必须 return nil, err 避免死锁
+				return nil, streamErr
 			}
 			return ch, nil
 		})
 
+		// 只有在 cb.Execute 认为 err == nil (即没有触发熔断机制拦截，且业务没有返回需要熔断的错) 时
 		if err == nil {
+			// 需要特判一下因为 ContextCanceled 被我们放行出来的错误
+			if rawRes == nil {
+				// 说明是 context.Canceled
+				return nil, context.Canceled
+			}
 			return rawRes.(<-chan StreamMessage), nil
 		}
 
 		lastErr = err
 		if errors.Is(err, gobreaker.ErrOpenState) {
-			log.Printf("🚨 [%s] 熔断器已开启，跳过流式重试", p.Name())
+			log.Printf("🚨 [%s] 模型 [%s] 熔断器已开启，跳过流式重试", p.Name(), model)
 			continue
 		}
-		log.Printf("⚠️ [%s] 流式连接失败: %v，准备切换备用模型", p.Name(), err)
+		log.Printf("⚠️ [%s] 模型 [%s] 流式连接失败: %v，准备切换备用渠道", p.Name(), model, err)
 	}
-	return nil, fmt.Errorf("所有模型流式连接均失败: %w", lastErr)
+	
+	return nil, fmt.Errorf("模型 %s 的所有渠道流式连接均失败: %w", model, lastErr)
+}
+
+// RouterManager 用于安全地管理和热替换 LLMRouter
+type RouterManager struct {
+	// 题目 1.1：声明一个 atomic.Value 类型的变量，命名为 current
+	current atomic.Value
+}
+
+func NewRouterManager(initialRouter *LLMRouter) *RouterManager {
+	rm := &RouterManager{}
+	// 题目 1.2：使用 Store 方法，将 initialRouter 存入 current 中
+	rm.current.Store(initialRouter)
+	return rm
+}
+
+func (rm *RouterManager) Get() *LLMRouter {
+	// 题目 1.3：使用 Load 方法取出值，并使用类型断言将其转换为 *LLMRouter 返回
+	return rm.current.Load().(*LLMRouter)
+}
+
+func (rm *RouterManager) Reload(newRouter *LLMRouter) {
+	// 题目 1.4：使用 Store 方法，将 newRouter 存入 current 中，完成热替换
+	rm.current.Store(newRouter)
 }

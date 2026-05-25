@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Gateway - 开发者中心</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans">
+    <div id="app" v-cloak>
+        
+        <!-- ================= 登录/注册页面 ================= -->
+        <div v-if="!isLoggedIn" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-emerald-400 to-teal-600">
+            <div class="bg-white p-8 rounded-xl shadow-2xl w-96">
+                <h1 class="text-2xl font-bold mb-2 text-center text-teal-600">开发者中心</h1>
+                <p class="text-center text-gray-500 mb-6 text-sm">管理您的 API Key 与额度</p>
+                
+                <!-- 切换标签 -->
+                <div class="flex mb-6 border-b">
+                    <button @click="isLoginMode = true" :class="{'border-teal-500 text-teal-600 border-b-2': isLoginMode, 'text-gray-500': !isLoginMode}" class="flex-1 pb-2 font-medium transition">登录</button>
+                    <button @click="isLoginMode = false" :class="{'border-teal-500 text-teal-600 border-b-2': !isLoginMode, 'text-gray-500': isLoginMode}" class="flex-1 pb-2 font-medium transition">注册</button>
+                </div>
+
+                <form @submit.prevent="handleAuth">
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700">用户名</label>
+                        <input v-model="authForm.username" type="text" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-teal-500 focus:border-teal-500" required placeholder="请输入用户名">
+                    </div>
+                    <div class="mb-6">
+                        <label class="block text-sm font-medium text-gray-700">密码</label>
+                        <input v-model="authForm.password" type="password" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-teal-500 focus:border-teal-500" required placeholder="请输入密码">
+                    </div>
+                    <button type="submit" class="w-full bg-teal-600 text-white font-bold py-2 px-4 rounded-md hover:bg-teal-700 transition shadow-lg">
+                        {{ isLoginMode ? '登 录' : '注 册' }}
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- ================= 主控制台页面 ================= -->
+        <div v-else class="flex h-screen overflow-hidden">
+            <!-- 侧边栏 -->
+            <aside class="w-64 bg-teal-800 text-white flex flex-col shadow-xl z-10">
+                <div class="p-6 text-xl font-bold border-b border-teal-700 flex items-center gap-2">
+                    <span>⚡</span> AI Gateway
+                </div>
+                <nav class="flex-1 p-4 space-y-2">
+                    <button class="w-full text-left p-3 rounded bg-teal-700 font-medium shadow transition">🔑 我的 API Key</button>
+                </nav>
+                <div class="p-4 border-t border-teal-700">
+                    <div class="mb-4 text-sm text-teal-200 px-2">当前用户: <span class="font-bold text-white">{{ currentUsername }}</span></div>
+                    <button @click="logout" class="w-full bg-red-500 text-white py-2 rounded hover:bg-red-600 transition shadow">退出登录</button>
+                </div>
+            </aside>
+
+            <!-- 右侧内容区 -->
+            <main class="flex-1 p-8 overflow-y-auto bg-gray-50">
+                <div class="flex justify-between items-center mb-8">
+                    <h2 class="text-3xl font-bold text-gray-800">我的 API Key</h2>
+                    <button @click="showCreateModal = true" class="bg-teal-600 text-white px-5 py-2.5 rounded-md shadow-md hover:bg-teal-700 transition font-medium flex items-center gap-2">
+                        <span>+</span> 创建新 Key
+                    </button>
+                </div>
+                
+                <!-- Key 列表表格 -->
+                <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                    <table class="min-w-full">
+                        <thead class="bg-gray-50 border-b border-gray-100">
+                            <tr>
+                                <th class="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">应用名称</th>
+                                <th class="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">API Key</th>
+                                <th class="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">状态</th>
+                                <th class="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">余额 (体验金)</th>
+                                <th class="px-6 py-4 text-right text-xs font-semibold text-gray-500 uppercase tracking-wider">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-gray-100">
+                            <tr v-if="appKeys.length === 0">
+                                <td colspan="5" class="px-6 py-12 text-center text-gray-400">暂无 API Key，请点击右上角创建</td>
+                            </tr>
+                            <tr v-for="key in appKeys" :key="key.ID" class="hover:bg-gray-50 transition">
+                                <td class="px-6 py-4 font-medium text-gray-800">{{ key.AppName }}</td>
+                                <td class="px-6 py-4 text-sm text-gray-500 font-mono bg-gray-50 rounded">{{ key.Key }}</td>
+                                <td class="px-6 py-4">
+                                    <span v-if="key.Status === 1" class="px-2.5 py-1 bg-green-100 text-green-700 text-xs font-bold rounded-full">正常</span>
+                                    <span v-else class="px-2.5 py-1 bg-red-100 text-red-700 text-xs font-bold rounded-full">已禁用</span>
+                                </td>
+                                <td class="px-6 py-4 text-sm font-bold text-orange-500">{{ (key.Balance / 10000).toFixed(4) }} 元</td>
+                                <td class="px-6 py-4 text-right text-sm font-medium space-x-3">
+                                    <button @click="openEditModal(key)" class="text-teal-600 hover:text-teal-900">编辑</button>
+                                    <button @click="deleteKey(key.ID)" class="text-red-600 hover:text-red-900">删除</button>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </main>
+        </div>
+
+        <!-- ================= 创建 Key 弹窗 ================= -->
+        <div v-if="showCreateModal" class="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+            <div class="bg-white p-6 rounded-xl shadow-2xl w-96 transform transition-all">
+                <h3 class="text-xl font-bold mb-4 text-gray-800">创建 API Key</h3>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">应用名称</label>
+                        <input v-model="newKeyForm.app_name" type="text" class="block w-full border border-gray-300 rounded-md p-2.5 focus:ring-teal-500 focus:border-teal-500" placeholder="例如：我的个人博客">
+                    </div>
+                    <p class="text-xs text-gray-500">提示：创建成功后系统将自动赠送 10万 Token 体验金！</p>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button @click="showCreateModal = false" class="px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 transition">取消</button>
+                    <button @click="createKey" class="px-4 py-2 bg-teal-600 text-white rounded-md hover:bg-teal-700 transition shadow">确认创建</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================= 编辑 Key 弹窗 ================= -->
+        <div v-if="showEditModal" class="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+            <div class="bg-white p-6 rounded-xl shadow-2xl w-96 transform transition-all">
+                <h3 class="text-xl font-bold mb-4 text-gray-800">编辑 API Key</h3>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">应用名称</label>
+                        <input v-model="editKeyForm.app_name" type="text" class="block w-full border border-gray-300 rounded-md p-2.5 focus:ring-teal-500 focus:border-teal-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">状态</label>
+                        <select v-model="editKeyForm.status" class="block w-full border border-gray-300 rounded-md p-2.5 focus:ring-teal-500 focus:border-teal-500">
+                            <option :value="1">正常 (启用)</option>
+                            <option :value="0">禁用 (暂停使用)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button @click="showEditModal = false" class="px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 transition">取消</button>
+                    <button @click="updateKey" class="px-4 py-2 bg-teal-600 text-white rounded-md hover:bg-teal-700 transition shadow">保存修改</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Vue 3 逻辑代码 -->
+    <script>
+        const { createApp, ref, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                // 状态变量
+                const token = ref(localStorage.getItem('user_token') || '');
+                const currentUsername = ref(localStorage.getItem('user_name') || '');
+                const isLoggedIn = ref(!!token.value);
+                
+                const isLoginMode = ref(true);
+                const authForm = ref({ username: '', password: '' });
+                
+                const appKeys = ref([]);
+                
+                // 弹窗状态
+                const showCreateModal = ref(false);
+                const newKeyForm = ref({ app_name: '' });
+
+                const showEditModal = ref(false);
+                const editKeyForm = ref({ id: null, app_name: '', status: 1 });
+
+                // 封装带 Token 的请求函数
+                const apiFetch = async (url, options = {}) => {
+                    const headers = {
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    };
+                    if (token.value) {
+                        headers['Authorization'] = `Bearer ${token.value}`;
+                    }
+                    const response = await fetch(url, { ...options, headers });
+                    
+                    // 处理 204 No Content (删除成功)
+                    if (response.status === 204) return { success: true };
+
+                    const data = await response.json();
+
+                    if (response.status === 401 || response.status === 403) {
+                        alert(data.error || '登录已过期或无权访问，请重新登录');
+                        logout();
+                        throw new Error('Unauthorized');
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.error || '请求失败');
+                    }
+                    return data;
+                };
+
+                // 登录 / 注册处理
+                const handleAuth = async () => {
+                    try {
+                        const url = isLoginMode.value ? '/api/v1/user/login' : '/api/v1/user/register';
+                        const res = await apiFetch(url, {
+                            method: 'POST',
+                            body: JSON.stringify(authForm.value)
+                        });
+
+                        if (isLoginMode.value) {
+                            // 登录成功
+                            token.value = res.token;
+                            currentUsername.value = authForm.value.username;
+                            localStorage.setItem('user_token', res.token);
+                            localStorage.setItem('user_name', authForm.value.username);
+                            isLoggedIn.value = true;
+                            fetchKeys();
+                        } else {
+                            // 注册成功
+                            alert('注册成功！请登录。');
+                            isLoginMode.value = true;
+                            authForm.value.password = ''; // 清空密码让他重新输一遍登录
+                        }
+                    } catch (e) {
+                        alert(e.message);
+                    }
+                };
+
+                // 退出登录
+                const logout = () => {
+                    token.value = '';
+                    currentUsername.value = '';
+                    localStorage.removeItem('user_token');
+                    localStorage.removeItem('user_name');
+                    isLoggedIn.value = false;
+                };
+
+                // 获取 Key 列表
+                const fetchKeys = async () => {
+                    try {
+                        const res = await apiFetch('/api/v1/tenant/keys?size=100');
+                        if (res.data && res.data.list) {
+                            appKeys.value = res.data.list;
+                        } else {
+                            appKeys.value =[];
+                        }
+                    } catch (e) {
+                        console.error(e);
+                    }
+                };
+
+                // 创建新 Key
+                const createKey = async () => {
+                    if (!newKeyForm.value.app_name) {
+                        alert("请输入应用名称");
+                        return;
+                    }
+                    try {
+                        // 注意：后端 CreateAppKeyRequest 结构体要求 rpm_limit 和 tpm_limit 是 required
+                        // 虽然租户不能决定最终额度，但为了通过 Gin 的 binding 校验，我们传个默认值过去
+                        const payload = {
+                            app_name: newKeyForm.value.app_name,
+                            rpm_limit: 60,
+                            tpm_limit: 1000
+                        };
+                        await apiFetch('/api/v1/tenant/keys', {
+                            method: 'POST',
+                            body: JSON.stringify(payload)
+                        });
+                        alert('创建成功！');
+                        showCreateModal.value = false;
+                        newKeyForm.value.app_name = '';
+                        fetchKeys();
+                    } catch (e) {
+                        alert(e.message);
+                    }
+                };
+
+                // 打开编辑弹窗
+                const openEditModal = (key) => {
+                    editKeyForm.value = {
+                        id: key.ID,
+                        app_name: key.AppName,
+                        status: key.Status
+                    };
+                    showEditModal.value = true;
+                };
+
+                // 更新 Key
+                const updateKey = async () => {
+                    try {
+                        await apiFetch(`/api/v1/tenant/keys/${editKeyForm.value.id}`, {
+                            method: 'PUT',
+                            body: JSON.stringify({
+                                app_name: editKeyForm.value.app_name,
+                                status: editKeyForm.value.status
+                            })
+                        });
+                        alert('更新成功！');
+                        showEditModal.value = false;
+                        fetchKeys();
+                    } catch (e) {
+                        alert(e.message);
+                    }
+                };
+
+                // 删除 Key
+                const deleteKey = async (id) => {
+                    if (!confirm("⚠️ 警告：删除后该 API Key 将立即失效，且无法恢复！确定要删除吗？")) {
+                        return;
+                    }
+                    try {
+                        await apiFetch(`/api/v1/tenant/keys/${id}`, {
+                            method: 'DELETE'
+                        });
+                        alert('删除成功！');
+                        fetchKeys();
+                    } catch (e) {
+                        alert(e.message);
+                    }
+                };
+
+                // 初始化
+                onMounted(() => {
+                    if (isLoggedIn.value) {
+                        fetchKeys();
+                    }
+                });
+
+                return {
+                    isLoggedIn, currentUsername, isLoginMode, authForm, appKeys,
+                    showCreateModal, newKeyForm, showEditModal, editKeyForm,
+                    handleAuth, logout, fetchKeys, createKey, openEditModal, updateKey, deleteKey
+                };
+            }
+        }).mount('#app');
+    </script>
+    <style>
+        [v-cloak] { display: none; }
+    </style>
+</body>
+</html>
